@@ -75,6 +75,42 @@ _RULES: list[Rule] = [
         ok_example="d = #2025-01-15#",
         fix_hint="Use m/d/y, yyyy-mm-dd, d-mmm-y, or 'MMMM d, y' format with valid date components.",
     ),
+    Rule(
+        rule_id="VBA_LEX004",
+        title="Unterminated string or missing end bracket",
+        severity="error",
+        category="lexer",
+        phase="3.9",
+        description=(
+            "A string literal has no closing `\"`, or a bracket-quoted name "
+            "`[…]` has no closing `]`."
+        ),
+        fail_example='s = "hello',
+        ok_example='s = "hello"',
+        fix_hint="Add the missing closing quote or `]`.",
+    ),
+    Rule(
+        rule_id="VBA_LEX005",
+        title="Identifier too long",
+        severity="error",
+        category="lexer",
+        phase="3.9",
+        description="VBA identifiers (names) are limited to 255 characters.",
+        fail_example="Dim aaaa…(>255 chars) As Long",
+        ok_example="Dim total As Long",
+        fix_hint="Shorten the identifier to 255 characters or fewer.",
+    ),
+    Rule(
+        rule_id="VBA_LEX006",
+        title="Line too long",
+        severity="error",
+        category="lexer",
+        phase="3.9",
+        description="A physical source line exceeds VBA's 1023-character limit.",
+        fail_example="' a single line longer than 1023 characters …",
+        ok_example="' wrap with the line-continuation character `_`",
+        fix_hint="Break the line using the `_` line-continuation character.",
+    ),
 
     # -- Round-trip verification (Phase 4.5) -------------------------
     Rule(
@@ -319,6 +355,286 @@ _RULES: list[Rule] = [
         fix_hint="Use `s = vbNullString` for a String, or declare an array.",
     ),
 
+    # -- Phase 1.6: declared-type resolution ------------------------
+    Rule(
+        rule_id="VBA120",
+        title="User-defined type not defined",
+        severity="warning",
+        category="type",
+        phase="1.6",
+        description=(
+            "A declared type name does not resolve to any built-in type, "
+            "source-declared `Type`/`Enum`/class, or host-model class. "
+            "Library-qualified names (`Scripting.Dictionary`) are accepted "
+            "leniently so un-modelled hosts don't false-positive."
+        ),
+        fail_example="Dim x As Custmer   ' typo for Customer",
+        ok_example="Dim x As Customer",
+        fix_hint="Define the `Type`/`Enum`/class, fix the spelling, or load the matching host model with `--host`.",
+    ),
+    Rule(
+        rule_id="VBA122",
+        title="User-defined type without members",
+        severity="error",
+        category="type",
+        phase="1.6",
+        description="A `Type … End Type` block must declare at least one member.",
+        fail_example="Type Empty\nEnd Type",
+        ok_example="Type Point\n    x As Long\nEnd Type",
+        fix_hint="Add at least one field, or remove the empty Type.",
+    ),
+    Rule(
+        rule_id="VBA123",
+        title="Empty Enum not allowed",
+        severity="error",
+        category="type",
+        phase="1.6",
+        description="An `Enum … End Enum` block must declare at least one member.",
+        fail_example="Enum Empty\nEnd Enum",
+        ok_example="Enum Color\n    Red\nEnd Enum",
+        fix_hint="Add at least one member, or remove the empty Enum.",
+    ),
+
+    # -- Phase 1.5: block-terminator pairing ------------------------
+    Rule(
+        rule_id="VBA110",
+        title="For without Next",
+        severity="error",
+        category="syntax",
+        phase="1.5",
+        description=(
+            "A `For` / `For Each` loop body reached the end of the procedure "
+            "(or module) without a matching `Next`. VBE refuses to compile an "
+            "unterminated loop."
+        ),
+        fail_example="For i = 1 To 10\n    Debug.Print i",
+        ok_example="For i = 1 To 10\n    Debug.Print i\nNext i",
+        fix_hint="Add the matching `Next` (optionally `Next i`) that closes the loop.",
+    ),
+    Rule(
+        rule_id="VBA111",
+        title="Do without Loop",
+        severity="error",
+        category="syntax",
+        phase="1.5",
+        description="A `Do` block has no matching `Loop`.",
+        fail_example="Do While x < 10\n    x = x + 1",
+        ok_example="Do While x < 10\n    x = x + 1\nLoop",
+        fix_hint="Add the `Loop` (optionally `Loop While`/`Loop Until`) that closes the `Do`.",
+    ),
+    Rule(
+        rule_id="VBA112",
+        title="While without Wend",
+        severity="error",
+        category="syntax",
+        phase="1.5",
+        description="A `While` block has no matching `Wend`.",
+        fail_example="While x < 10\n    x = x + 1",
+        ok_example="While x < 10\n    x = x + 1\nWend",
+        fix_hint="Add the `Wend` that closes the `While`.",
+    ),
+    Rule(
+        rule_id="VBA113",
+        title="Expected End With",
+        severity="error",
+        category="syntax",
+        phase="1.5",
+        description="A `With` block has no matching `End With`.",
+        fail_example="With rng\n    .Value = 1",
+        ok_example="With rng\n    .Value = 1\nEnd With",
+        fix_hint="Add the `End With` that closes the block.",
+    ),
+    Rule(
+        rule_id="VBA114",
+        title="Select Case without End Select",
+        severity="error",
+        category="syntax",
+        phase="1.5",
+        description="A `Select Case` block has no matching `End Select`.",
+        fail_example="Select Case x\n    Case 1\n        Debug.Print 1",
+        ok_example="Select Case x\n    Case 1\n        Debug.Print 1\nEnd Select",
+        fix_hint="Add the `End Select` that closes the block.",
+    ),
+    Rule(
+        rule_id="VBA115",
+        title="Block If without End If",
+        severity="error",
+        category="syntax",
+        phase="1.5",
+        description=(
+            "A block `If … Then` (the multi-line form, where `Then` is the "
+            "last token on the line) reached the end of the procedure without "
+            "a matching `End If`."
+        ),
+        fail_example="If x > 0 Then\n    Debug.Print x",
+        ok_example="If x > 0 Then\n    Debug.Print x\nEnd If",
+        fix_hint="Add the `End If`, or convert to a single-line `If x > 0 Then Debug.Print x`.",
+    ),
+    Rule(
+        rule_id="VBA116",
+        title="Next without For",
+        severity="error",
+        category="syntax",
+        phase="1.5",
+        description="A `Next` appears with no `For` loop open in scope.",
+        fail_example="    Debug.Print i\nNext i",
+        ok_example="For i = 1 To 10\n    Debug.Print i\nNext i",
+        fix_hint="Remove the stray `Next` or add the opening `For`.",
+    ),
+    Rule(
+        rule_id="VBA117",
+        title="Loop without Do",
+        severity="error",
+        category="syntax",
+        phase="1.5",
+        description="A `Loop` appears with no `Do` block open in scope.",
+        fail_example="    x = x + 1\nLoop",
+        ok_example="Do\n    x = x + 1\nLoop While x < 10",
+        fix_hint="Remove the stray `Loop` or add the opening `Do`.",
+    ),
+    Rule(
+        rule_id="VBA118",
+        title="Wend without While",
+        severity="error",
+        category="syntax",
+        phase="1.5",
+        description="A `Wend` appears with no `While` block open in scope.",
+        fail_example="    x = x + 1\nWend",
+        ok_example="While x < 10\n    x = x + 1\nWend",
+        fix_hint="Remove the stray `Wend` or add the opening `While`.",
+    ),
+    Rule(
+        rule_id="VBA119",
+        title="Block terminator without matching opener",
+        severity="error",
+        category="syntax",
+        phase="1.5",
+        description=(
+            "A block terminator (`Else`, `ElseIf`, `End If`, `End Select`, "
+            "`End With`, …) appears with no matching opening statement in "
+            "scope — typically the symptom of an earlier mis-nested block."
+        ),
+        fail_example="Debug.Print 1\nEnd If",
+        ok_example="If x > 0 Then\n    Debug.Print 1\nEnd If",
+        fix_hint="Fix the surrounding block nesting; an opener is missing or an earlier block closed too early.",
+    ),
+
+    # -- Phase 2.10: parameter-list well-formedness -----------------
+    Rule(
+        rule_id="VBA130",
+        title="Required parameter after Optional",
+        severity="error",
+        category="signature",
+        phase="2.10",
+        description=(
+            "Once a parameter is declared `Optional`, every parameter after "
+            "it must also be `Optional` (the trailing `ParamArray` aside)."
+        ),
+        fail_example="Sub S(Optional a As Long, b As Long): End Sub",
+        ok_example="Sub S(Optional a As Long, Optional b As Long): End Sub",
+        fix_hint="Mark the trailing parameters `Optional`, or move the required ones before the first Optional.",
+    ),
+    Rule(
+        rule_id="VBA131",
+        title="ParamArray is not the last parameter",
+        severity="error",
+        category="signature",
+        phase="2.10",
+        description="`ParamArray` must be the final parameter of a procedure.",
+        fail_example="Sub S(ParamArray a() As Variant, b As Long): End Sub",
+        ok_example="Sub S(b As Long, ParamArray a() As Variant): End Sub",
+        fix_hint="Move the `ParamArray` to the end of the parameter list.",
+    ),
+    Rule(
+        rule_id="VBA132",
+        title="More than one ParamArray",
+        severity="error",
+        category="signature",
+        phase="2.10",
+        description="A procedure may declare at most one `ParamArray`.",
+        fail_example="Sub S(ParamArray a() As Variant, ParamArray b() As Variant): End Sub",
+        ok_example="Sub S(ParamArray a() As Variant): End Sub",
+        fix_hint="Keep a single `ParamArray` and pass the rest explicitly.",
+    ),
+    Rule(
+        rule_id="VBA133",
+        title="ParamArray combined with Optional",
+        severity="error",
+        category="signature",
+        phase="2.10",
+        description="A procedure cannot mix `Optional` parameters with a `ParamArray`.",
+        fail_example="Sub S(Optional a As Long, ParamArray b() As Variant): End Sub",
+        ok_example="Sub S(a As Long, ParamArray b() As Variant): End Sub",
+        fix_hint="Drop the `Optional` markers or the `ParamArray` — they are mutually exclusive.",
+    ),
+    Rule(
+        rule_id="VBA134",
+        title="ParamArray element type is not Variant",
+        severity="error",
+        category="signature",
+        phase="2.10",
+        description="A `ParamArray` must be declared as an array of `Variant`.",
+        fail_example="Sub S(ParamArray a() As Long): End Sub",
+        ok_example="Sub S(ParamArray a() As Variant): End Sub",
+        fix_hint="Declare the ParamArray as `ParamArray name() As Variant`.",
+    ),
+    Rule(
+        rule_id="VBA137",
+        title="User-defined type passed ByVal",
+        severity="error",
+        category="signature",
+        phase="2.10",
+        description="A user-defined `Type` parameter must be passed `ByRef`, not `ByVal`.",
+        fail_example="Type T\n    x As Long\nEnd Type\nSub S(ByVal p As T)\nEnd Sub",
+        ok_example="Type T\n    x As Long\nEnd Type\nSub S(ByRef p As T)\nEnd Sub",
+        fix_hint="Change the parameter to `ByRef` (the default).",
+    ),
+    Rule(
+        rule_id="VBA136",
+        title="Array parameter passed ByVal",
+        severity="error",
+        category="signature",
+        phase="2.10",
+        description="Array parameters must be passed `ByRef`; `ByVal` arrays are illegal in VBA.",
+        fail_example="Sub S(ByVal a() As Long): End Sub",
+        ok_example="Sub S(ByRef a() As Long): End Sub",
+        fix_hint="Change the parameter mechanism to `ByRef` (the default).",
+    ),
+
+    # -- Phase 2.14: type-declaration character --------------------
+    Rule(
+        rule_id="VBA270",
+        title="Type-declaration character does not match declared type",
+        severity="error",
+        category="declaration",
+        phase="2.14",
+        description=(
+            "A legacy type-declaration suffix (`$` String, `%` Integer, `@` "
+            "Currency) on a variable name must agree with its explicit `As` "
+            "type."
+        ),
+        fail_example="Dim count% As Long",
+        ok_example="Dim count As Long   ' or: Dim count%",
+        fix_hint="Drop the suffix, or make the `As` type match it.",
+    ),
+
+    # -- Phase 3.10: object-module member restrictions -------------
+    Rule(
+        rule_id="VBA370",
+        title="Constant/array/Declare as Public member of object module",
+        severity="error",
+        category="placement",
+        phase="3.10",
+        description=(
+            "Constants, arrays and `Declare` statements cannot be Public "
+            "members of an object module (Class / Form). They are only legal "
+            "in standard modules, or as Private members."
+        ),
+        fail_example="' in a .cls:\nPublic Const MAX As Long = 10",
+        ok_example="' in a .cls:\nPrivate Const MAX As Long = 10",
+        fix_hint="Move it to a standard module, or mark it Private and expose it via a Property Get.",
+    ),
+
     # -- Phase 2.1: jumps -------------------------------------------
     Rule(
         rule_id="VBA201",
@@ -330,6 +646,216 @@ _RULES: list[Rule] = [
         fail_example="Sub S()\n    GoTo NoSuch\nEnd Sub",
         ok_example="Sub S()\n    GoTo Skip\nSkip:\nEnd Sub",
         fix_hint="Declare the label or fix the spelling. Special forms `On Error GoTo 0`, `On Error GoTo -1`, and `On Error Resume Next` do not need a target.",
+    ),
+
+    # -- Phase 2.9: named arguments at call sites -------------------
+    Rule(
+        rule_id="VBA140",
+        title="Named argument not found",
+        severity="error",
+        category="signature",
+        phase="2.9",
+        description="A `name:=value` call argument names a parameter the target procedure does not declare.",
+        fail_example="Sub S(ByVal a As Long)\nEnd Sub\nSub T()\n    Call S(b:=1)\nEnd Sub",
+        ok_example="Sub S(ByVal a As Long)\nEnd Sub\nSub T()\n    Call S(a:=1)\nEnd Sub",
+        fix_hint="Use a parameter name that exists in the procedure signature.",
+    ),
+    Rule(
+        rule_id="VBA141",
+        title="Named argument specified more than once",
+        severity="error",
+        category="signature",
+        phase="2.9",
+        description="The same named argument appears twice in one call.",
+        fail_example="Call S(a:=1, a:=2)",
+        ok_example="Call S(a:=1, b:=2)",
+        fix_hint="Pass each named argument at most once.",
+    ),
+    Rule(
+        rule_id="VBA142",
+        title="Named arguments with ParamArray",
+        severity="error",
+        category="signature",
+        phase="2.9",
+        description="A procedure declaring a `ParamArray` cannot be called using named arguments.",
+        fail_example="Sub S(ParamArray a() As Variant)\nEnd Sub\nSub T()\n    Call S(a:=1)\nEnd Sub",
+        ok_example="Sub S(ParamArray a() As Variant)\nEnd Sub\nSub T()\n    Call S(1, 2, 3)\nEnd Sub",
+        fix_hint="Pass arguments positionally when the procedure has a ParamArray.",
+    ),
+
+    # -- Phase 2.12: procedure / property consistency ---------------
+    Rule(
+        rule_id="VBA151",
+        title="Code after End Sub/Function/Property",
+        severity="error",
+        category="syntax",
+        phase="2.12",
+        description=(
+            "Only comments may appear after `End Sub`, `End Function`, or "
+            "`End Property` on the same line."
+        ),
+        fail_example="Sub S()\nEnd Sub: x = 1",
+        ok_example="Sub S()\nEnd Sub   ' done",
+        fix_hint="Move the trailing statement to its own line.",
+    ),
+    Rule(
+        rule_id="VBA150",
+        title="Ambiguous name detected (duplicate procedure)",
+        severity="error",
+        category="declaration",
+        phase="2.12",
+        description=(
+            "Two procedures share the same name in one module. Property "
+            "Get/Let/Set may share a name, but two of the same accessor kind "
+            "(or two Subs/Functions) may not."
+        ),
+        fail_example="Sub Foo()\nEnd Sub\nSub Foo()\nEnd Sub",
+        ok_example="Sub Foo()\nEnd Sub\nSub Bar()\nEnd Sub",
+        fix_hint="Rename or remove the duplicate procedure.",
+    ),
+    Rule(
+        rule_id="VBA152",
+        title="Property Get/Let type inconsistent",
+        severity="error",
+        category="property",
+        phase="2.12",
+        description=(
+            "A `Property Get` return type and the matching `Property Let` "
+            "value-parameter type must agree."
+        ),
+        fail_example=(
+            "Property Get Foo() As Long\nEnd Property\n"
+            "Property Let Foo(ByVal v As String)\nEnd Property"
+        ),
+        ok_example=(
+            "Property Get Foo() As Long\nEnd Property\n"
+            "Property Let Foo(ByVal v As Long)\nEnd Property"
+        ),
+        fix_hint="Make the Get return type and the Let value-parameter type identical.",
+    ),
+    Rule(
+        rule_id="VBA153",
+        title="Implements method signature mismatch",
+        severity="error",
+        category="interface",
+        phase="2.12",
+        description=(
+            "A method implementing an interface member must match the "
+            "member's parameter count."
+        ),
+        fail_example=(
+            "' IShape: Public Sub Draw(ByVal scale As Double)\n"
+            "Implements IShape\n"
+            "Private Sub IShape_Draw()\nEnd Sub"
+        ),
+        ok_example=(
+            "Implements IShape\n"
+            "Private Sub IShape_Draw(ByVal scale As Double)\nEnd Sub"
+        ),
+        fix_hint="Match the interface member's parameter list exactly.",
+    ),
+
+    # -- Phase 2.13: assignment / expression semantics --------------
+    Rule(
+        rule_id="VBA160",
+        title="Assignment to constant not permitted",
+        severity="error",
+        category="assignment",
+        phase="2.13",
+        description="A `Const` or `Enum` member is read-only and cannot be assigned to.",
+        fail_example="Const PI As Double = 3.14159\nPI = 3",
+        ok_example="Const PI As Double = 3.14159\nDim r As Double\nr = PI",
+        fix_hint="Assign to a variable, not a constant or Enum member.",
+    ),
+    Rule(
+        rule_id="VBA164",
+        title="Invalid use of Me keyword",
+        severity="error",
+        category="assignment",
+        phase="2.13",
+        description="`Me` refers to the current instance and cannot be assigned to.",
+        fail_example="Set Me = Nothing",
+        ok_example="Set obj = Me",
+        fix_hint="Use a regular object variable as the assignment target.",
+    ),
+    Rule(
+        rule_id="VBA165",
+        title="Invalid use of New keyword",
+        severity="error",
+        category="declaration",
+        phase="2.13",
+        description="`New` requires a creatable class; primitives, `Object` and `Variant` cannot be `New`-ed.",
+        fail_example="Dim x As New Long",
+        ok_example="Dim c As New Collection",
+        fix_hint="Use `New` only with a class type, or drop `New` for primitives.",
+    ),
+
+    # -- Phase 2.11: loop / label context ---------------------------
+    Rule(
+        rule_id="VBA170",
+        title="Exit For not within For...Next",
+        severity="error",
+        category="control_flow",
+        phase="2.11",
+        description="`Exit For` is only valid inside a `For` / `For Each` loop.",
+        fail_example="Sub S()\n    Exit For\nEnd Sub",
+        ok_example="Sub S()\n    For i = 1 To 10\n        Exit For\n    Next i\nEnd Sub",
+        fix_hint="Remove the `Exit For` or place it inside a `For` loop.",
+    ),
+    Rule(
+        rule_id="VBA171",
+        title="Exit Do not within Do...Loop",
+        severity="error",
+        category="control_flow",
+        phase="2.11",
+        description="`Exit Do` is only valid inside a `Do...Loop`.",
+        fail_example="Sub S()\n    Exit Do\nEnd Sub",
+        ok_example="Sub S()\n    Do\n        Exit Do\n    Loop\nEnd Sub",
+        fix_hint="Remove the `Exit Do` or place it inside a `Do` loop.",
+    ),
+    Rule(
+        rule_id="VBA172",
+        title="Next control variable mismatch",
+        severity="error",
+        category="control_flow",
+        phase="2.11",
+        description="The variable on `Next x` must match the loop's `For` counter.",
+        fail_example="For i = 1 To 10\n    Debug.Print i\nNext j",
+        ok_example="For i = 1 To 10\n    Debug.Print i\nNext i",
+        fix_hint="Use the same variable as the `For` counter, or a bare `Next`.",
+    ),
+    Rule(
+        rule_id="VBA173",
+        title="For control variable already in use",
+        severity="error",
+        category="control_flow",
+        phase="2.11",
+        description="A nested `For` loop reuses the counter variable of an enclosing loop.",
+        fail_example="For i = 1 To 3\n    For i = 1 To 3\n    Next i\nNext i",
+        ok_example="For i = 1 To 3\n    For j = 1 To 3\n    Next j\nNext i",
+        fix_hint="Use a distinct counter variable for the inner loop.",
+    ),
+    Rule(
+        rule_id="VBA174",
+        title="For Each control variable must be Variant or object",
+        severity="error",
+        category="control_flow",
+        phase="2.11",
+        description="A `For Each` control variable cannot be a primitive scalar type.",
+        fail_example="Dim i As Long\nFor Each i In coll\nNext i",
+        ok_example="Dim v As Variant\nFor Each v In coll\nNext v",
+        fix_hint="Declare the control variable as `Variant`, `Object`, or a class type.",
+    ),
+    Rule(
+        rule_id="VBA175",
+        title="Duplicate label",
+        severity="error",
+        category="control_flow",
+        phase="2.11",
+        description="The same line label is declared more than once in a procedure.",
+        fail_example="Sub S()\nDone:\n    Exit Sub\nDone:\nEnd Sub",
+        ok_example="Sub S()\nDone:\n    Exit Sub\nEnd Sub",
+        fix_hint="Rename or remove the duplicate label.",
     ),
 
     # -- Phase 2.2: Set vs Let --------------------------------------
@@ -703,6 +1229,112 @@ _RULES: list[Rule] = [
             "End Sub\n"
         ),
         fix_hint="Move the statement into a procedure body — `Sub Main()` is a common entry point, or wrap it in an `Auto_Open` / `Workbook_Open` event handler.",
+    ),
+
+    # -- Phase 3.7 — Type / Enum / Def / Option placement -----------
+    Rule(
+        rule_id="VBA180",
+        title="Statement invalid inside Enum block",
+        severity="error",
+        category="placement",
+        phase="3.7",
+        description=(
+            "An `Enum … End Enum` block may only contain member declarations "
+            "(`Name [= value]`). Executable statements or `Dim`/`Sub`/… "
+            "declarations inside it are illegal."
+        ),
+        fail_example="Enum E\n    A = 1\n    Dim x As Long\nEnd Enum",
+        ok_example="Enum E\n    A = 1\n    B = 2\nEnd Enum",
+        fix_hint="Move the statement outside the Enum; keep only `Name = value` members inside.",
+    ),
+    Rule(
+        rule_id="VBA181",
+        title="Statement invalid inside Type block",
+        severity="error",
+        category="placement",
+        phase="3.7",
+        description=(
+            "A `Type … End Type` block may only contain field declarations "
+            "(`Name [(dims)] As Type`). Executable statements or "
+            "`Dim`/`Sub`/… declarations inside it are illegal."
+        ),
+        fail_example="Type T\n    x As Long\n    Sub Foo()\nEnd Type",
+        ok_example="Type T\n    x As Long\n    y As String\nEnd Type",
+        fix_hint="Move the statement outside the Type; keep only `Name As Type` fields inside.",
+    ),
+    Rule(
+        rule_id="VBA182",
+        title="Deftype statement must precede declarations",
+        severity="error",
+        category="placement",
+        phase="3.7",
+        description=(
+            "`DefInt`/`DefStr`/… statements must appear before any variable, "
+            "constant, type or procedure declaration in the module."
+        ),
+        fail_example="Dim x As Long\nDefInt A-Z",
+        ok_example="DefInt A-Z\nDim x As Long",
+        fix_hint="Move the `DefXxx` statement to the top of the module, after `Option` but before any declaration.",
+    ),
+    Rule(
+        rule_id="VBA183",
+        title="Duplicate Deftype letter range",
+        severity="error",
+        category="placement",
+        phase="3.7",
+        description="A letter cannot be covered by more than one `DefXxx` statement.",
+        fail_example="DefInt A-K\nDefStr H-Z",
+        ok_example="DefInt A-G\nDefStr H-Z",
+        fix_hint="Make the `DefXxx` letter ranges disjoint.",
+    ),
+    Rule(
+        rule_id="VBA184",
+        title="Duplicate Option statement",
+        severity="error",
+        category="placement",
+        phase="3.7",
+        description="The same `Option` statement (Explicit/Compare/Base/Private Module) appears twice.",
+        fail_example="Option Explicit\nOption Explicit",
+        ok_example="Option Explicit",
+        fix_hint="Remove the duplicate `Option` statement.",
+    ),
+
+    # -- Phase 3.8 — conditional compilation (#If) ------------------
+    Rule(
+        rule_id="VBA190",
+        title="Conditional directive without matching #If",
+        severity="error",
+        category="preprocessor",
+        phase="3.8",
+        description=(
+            "`#Else`, `#ElseIf` and `#End If` must be preceded by a matching "
+            "`#If`. A directive with no open `#If` is a compile error."
+        ),
+        fail_example="#Else\n    x = 1\n#End If",
+        ok_example="#If Win64 Then\n    x = 1\n#Else\n    x = 2\n#End If",
+        fix_hint="Add the opening `#If … Then`, or remove the orphan directive.",
+    ),
+    Rule(
+        rule_id="VBA191",
+        title="Missing #End If",
+        severity="error",
+        category="preprocessor",
+        phase="3.8",
+        description="Every `#If` conditional-compilation block must be closed with `#End If`.",
+        fail_example="#If Win64 Then\n    x = 1",
+        ok_example="#If Win64 Then\n    x = 1\n#End If",
+        fix_hint="Add the `#End If` that closes the `#If` block.",
+    ),
+    Rule(
+        rule_id="VBA192",
+        title="Invalid #Const declaration",
+        severity="error",
+        category="preprocessor",
+        phase="3.8",
+        description="A `#Const` directive must have the form `#Const Name = expression`.",
+        fail_example="#Const",
+        ok_example="#Const DEBUG_BUILD = 1",
+        fix_hint="Write `#Const Name = <constant expression>`.",
     ),
 ]
 

@@ -60,7 +60,9 @@ class Analyzer:
         self._current_labels = None
         self._current_proc_name = None
         self._current_def_type_map = {}
-        
+        self._loop_stack = []
+        self._for_var_stack = []
+
         # Load Standard/Config Globals into Global Scope
         for name, defn in self.config.object_model.get("globals", {}).items():
             # Use 'returns' as type if available, otherwise 'type'
@@ -160,6 +162,18 @@ class Analyzer:
             # Phase 2.3 — Property Get/Let/Set arity & type compatibility
             self._validate_property_arity(mod)
 
+            # Phase 2.10 — argument-list well-formedness (VBA130-VBA136)
+            self._validate_param_lists(mod)
+
+            # Phase 2.12 — duplicate procedure names (VBA150)
+            self._validate_duplicate_procedures(mod)
+
+            # Phase 1.6 — declared-type resolution (VBA120/122/123)
+            self._validate_declared_types(mod)
+
+            # Phase 3.10 — object-module member restrictions (VBA370)
+            self._validate_object_module_members(mod)
+
             # Phase 3.3 — Declare PtrSafe (64-bit) requirement
             self._validate_ptrsafe_declares(mod)
 
@@ -219,8 +233,9 @@ class Analyzer:
                     if proc.scope.lower() not in ('public', 'friend'):
                         continue
                     expected_name = f"{iface_name}_{proc.name}"
-                    found = any(p.name.lower() == expected_name.lower() for p in mod.procedures)
-                    if not found:
+                    impl = next((p for p in mod.procedures
+                                 if p.name.lower() == expected_name.lower()), None)
+                    if impl is None:
                         self.errors.append({
                             "file": mod.filename,
                             "line": 0,
@@ -232,6 +247,23 @@ class Analyzer:
                                 f"(matching {proc.proc_type} {proc.name})."
                             ),
                         })
+                    else:
+                        # VBA153 — the implementing method exists but its
+                        # parameter count disagrees with the interface member.
+                        iface_argc = len(getattr(proc, 'args', []) or [])
+                        impl_argc = len(getattr(impl, 'args', []) or [])
+                        if iface_argc != impl_argc:
+                            self.errors.append({
+                                "file": mod.filename,
+                                "line": getattr(impl, 'line', 0) or 0,
+                                "rule_id": "VBA153",
+                                "severity": "error",
+                                "message": (
+                                    f"'{expected_name}' does not match the interface "
+                                    f"member '{iface_name}.{proc.name}': expected "
+                                    f"{iface_argc} parameter(s), got {impl_argc}."
+                                ),
+                            })
 
     def _find_interface_module(self, iface_name):
         target = iface_name.lower()
@@ -455,6 +487,27 @@ class Analyzer:
                 # Set/Let semantic mismatch — independent of Get presence.
                 last_arg = accessor.args[-1]
                 kind = accessor.proc_type.split()[-1].lower()
+
+                # VBA152 — a Property Get and its Let must agree on the value
+                # type. Restricted to clearly-scalar primitives on both sides
+                # to stay false-positive-safe (object hierarchies / Variant
+                # coercions are intentionally not flagged).
+                if get_proc is not None and kind == 'let':
+                    get_t = (get_proc.return_type or 'Variant')
+                    let_t = (last_arg.type_name or 'Variant')
+                    if (self._is_clearly_scalar(get_t) and self._is_clearly_scalar(let_t)
+                            and get_t.replace('()', '').strip().lower()
+                                != let_t.replace('()', '').strip().lower()):
+                        self.errors.append({
+                            "file": mod.filename,
+                            "line": getattr(accessor, 'line', 0) or 0,
+                            "rule_id": "VBA152",
+                            "severity": "error",
+                            "message": (
+                                f"Property '{accessor.name}' is inconsistent: Property Get "
+                                f"returns '{get_t}' but Property Let takes '{let_t}'."
+                            ),
+                        })
                 rhs_is_object = self._is_clearly_object(last_arg.type_name)
                 rhs_is_scalar = self._is_clearly_scalar(last_arg.type_name)
                 if kind == 'set' and rhs_is_scalar:
@@ -480,6 +533,148 @@ class Analyzer:
                         ),
                     })
 
+    def _validate_duplicate_procedures(self, mod):
+        """VBA150 — two procedures share a name in the same module.
+
+        Property Get/Let/Set legitimately share a name (different accessor
+        kinds), so the dedup key includes the accessor kind for properties.
+        Property and non-property members are grouped separately to avoid
+        edge-case false positives.
+        """
+        seen = {}
+        for proc in mod.procedures:
+            ptype = (proc.proc_type or '').lower()
+            if ptype == 'event':
+                continue  # events have their own declaration namespace
+            if ptype.startswith('property'):
+                key = ('prop', proc.name.lower(), ptype.split()[-1])
+            else:
+                key = ('proc', proc.name.lower())
+            if key in seen:
+                self.errors.append({
+                    "file": mod.filename,
+                    "line": getattr(proc, 'line', 0) or 0,
+                    "rule_id": "VBA150",
+                    "severity": "error",
+                    "message": (
+                        f"Ambiguous name detected: '{proc.name}' is already defined "
+                        f"in module '{mod.name}'."
+                    ),
+                })
+            else:
+                seen[key] = proc
+
+    def _validate_param_lists(self, mod):
+        """Phase 2.10 — argument-list well-formedness (VBA130-VBA136).
+
+        Pure syntactic checks over each procedure's declared parameters; no
+        type model required, so these never false-positive on valid code.
+        """
+        for proc in mod.procedures:
+            args = getattr(proc, 'args', None) or []
+            if not args:
+                continue
+            line = getattr(proc, 'line', 0) or 0
+            ptype = proc.proc_type or "procedure"
+            # The trailing value parameter of a Property Let/Set is implicitly
+            # required (it receives the assigned RHS) and may legitimately
+            # follow Optional index parameters — exempt it from VBA130.
+            ptl = ptype.lower()
+            is_value_param_proc = ptl.startswith('property') and ptl.split()[-1] in ('let', 'set')
+            seen_optional = False
+            paramarray_count = 0
+            n = len(args)
+            for idx, arg in enumerate(args):
+                is_opt = getattr(arg, 'is_optional', False)
+                is_pa = getattr(arg, 'is_paramarray', False)
+
+                # VBA130 — once an Optional appears, every following parameter
+                # must be Optional (or the trailing ParamArray).
+                if is_opt:
+                    seen_optional = True
+                elif seen_optional and not is_pa and not (is_value_param_proc and idx == n - 1):
+                    self.errors.append({
+                        "file": mod.filename, "line": line,
+                        "rule_id": "VBA130", "severity": "error",
+                        "message": (
+                            f"Parameter '{arg.name}' of {ptype} '{proc.name}' is "
+                            f"required but follows an Optional parameter. Every "
+                            f"parameter after the first Optional must also be Optional."
+                        ),
+                    })
+
+                if is_pa:
+                    paramarray_count += 1
+                    # VBA131 — ParamArray must be the last parameter.
+                    if idx != n - 1:
+                        self.errors.append({
+                            "file": mod.filename, "line": line,
+                            "rule_id": "VBA131", "severity": "error",
+                            "message": (
+                                f"ParamArray '{arg.name}' must be the last parameter "
+                                f"of {ptype} '{proc.name}'."
+                            ),
+                        })
+                    # VBA132 — only one ParamArray allowed.
+                    if paramarray_count > 1:
+                        self.errors.append({
+                            "file": mod.filename, "line": line,
+                            "rule_id": "VBA132", "severity": "error",
+                            "message": (
+                                f"{ptype} '{proc.name}' declares more than one "
+                                f"ParamArray; only one is allowed."
+                            ),
+                        })
+                    # VBA134 — ParamArray element type must be Variant.
+                    base = (arg.type_name or 'Variant').replace('()', '').strip()
+                    if base and base.lower() != 'variant':
+                        self.errors.append({
+                            "file": mod.filename, "line": line,
+                            "rule_id": "VBA134", "severity": "error",
+                            "message": (
+                                f"ParamArray '{arg.name}' must be declared as an array "
+                                f"of Variant, not '{arg.type_name}'."
+                            ),
+                        })
+
+                # VBA136 — array parameters cannot be passed ByVal.
+                if (arg.type_name or '').endswith('()') and getattr(arg, 'mechanism', 'ByRef') == 'ByVal':
+                    self.errors.append({
+                        "file": mod.filename, "line": line,
+                        "rule_id": "VBA136", "severity": "error",
+                        "message": (
+                            f"Array parameter '{arg.name}' of {ptype} '{proc.name}' "
+                            f"must be passed ByRef, not ByVal."
+                        ),
+                    })
+
+                # VBA137 — user-defined types may not be passed ByVal (enums
+                # are Long under the hood and are exempt).
+                if getattr(arg, 'mechanism', 'ByRef') == 'ByVal':
+                    base_t = (arg.type_name or '').replace('()', '').strip().lower()
+                    udt = self.udts.get(base_t)
+                    if udt is not None and not getattr(udt, 'is_enum', False):
+                        self.errors.append({
+                            "file": mod.filename, "line": line,
+                            "rule_id": "VBA137", "severity": "error",
+                            "message": (
+                                f"User-defined type '{arg.type_name}' parameter "
+                                f"'{arg.name}' of {ptype} '{proc.name}' may not be "
+                                f"passed ByVal; use ByRef."
+                            ),
+                        })
+
+            # VBA133 — a ParamArray cannot coexist with Optional parameters.
+            if paramarray_count and any(getattr(a, 'is_optional', False) for a in args):
+                self.errors.append({
+                    "file": mod.filename, "line": line,
+                    "rule_id": "VBA133", "severity": "error",
+                    "message": (
+                        f"{ptype} '{proc.name}' combines Optional parameters with a "
+                        f"ParamArray; this is not allowed."
+                    ),
+                })
+
     def analyze_procedure(self, proc, mod_scope, mod):
         proc_scope = SymbolTable(proc.name, parent=mod_scope, scope_type='Procedure')
 
@@ -495,12 +690,65 @@ class Analyzer:
         self._current_proc_name = proc.name
         self._current_def_type_map = getattr(mod, "def_type_map", {}) or {}
 
+        # Phase 2.11 — VBA175: duplicate label declarations in the procedure.
+        self._validate_duplicate_labels(proc, mod.filename)
+
+        # Phase 2.11 — loop context for Exit For / Exit Do (VBA170/171) and
+        # For-counter checks (VBA172/173). Reset per procedure.
+        self._loop_stack = []
+        self._for_var_stack = []
+
         try:
             self.analyze_block(proc.body, proc_scope, mod.filename, proc.name, with_stack=[])
         finally:
             self._current_labels = None
             self._current_proc_name = None
             self._current_def_type_map = {}
+            self._loop_stack = []
+            self._for_var_stack = []
+
+    def _validate_duplicate_labels(self, proc, filename):
+        """VBA175 — the same line label declared twice in one procedure."""
+        seen = {}
+        ordered = []
+        self._collect_labels_ordered(proc.body, ordered)
+        for tok in ordered:
+            key = tok.value.lower()
+            if key in seen:
+                self.errors.append({
+                    "file": filename,
+                    "line": tok.line,
+                    "rule_id": "VBA175",
+                    "severity": "error",
+                    "message": (
+                        f"Duplicate label '{tok.value}' in '{proc.name}'. "
+                        f"A label may be declared only once per procedure."
+                    ),
+                })
+            else:
+                seen[key] = tok
+
+    def _collect_labels_ordered(self, nodes, out):
+        """Like `_collect_labels` but preserves order and keeps the token
+        (not just the lowercased name) so duplicates can be reported."""
+        from .parser import IfNode, WithNode, ForNode, DoNode, SelectNode, StatementNode
+        for node in nodes:
+            if isinstance(node, StatementNode):
+                if self.is_label(node.tokens):
+                    out.append(node.tokens[0])
+            elif isinstance(node, IfNode):
+                self._collect_labels_ordered(node.true_block, out)
+                for _cond, blk in node.else_blocks:
+                    self._collect_labels_ordered(blk, out)
+                if node.else_block:
+                    self._collect_labels_ordered(node.else_block, out)
+            elif isinstance(node, WithNode):
+                self._collect_labels_ordered(node.body, out)
+            elif isinstance(node, (ForNode, DoNode)):
+                self._collect_labels_ordered(node.body, out)
+            elif isinstance(node, SelectNode):
+                for case in node.cases:
+                    self._collect_labels_ordered(case.body, out)
 
     def _validate_jump_target(self, tokens, filename, context):
         """Validate `GoTo`, `On Error GoTo`, `Resume`, `GoSub` against the
@@ -668,6 +916,167 @@ class Analyzer:
             return True
         return False
 
+    _BUILTIN_TYPE_NAMES = {
+        "boolean", "byte", "integer", "long", "longlong", "longptr",
+        "single", "double", "currency", "decimal", "date", "string",
+        "object", "variant", "any", "iunknown", "idispatch",
+    }
+
+    # Type-declaration suffix → implied type. Only $ / % / @ survive lexing
+    # as part of the identifier token (& ! # are tokenised separately).
+    _TYPE_SUFFIX_MAP = {'$': 'string', '%': 'integer', '@': 'currency'}
+
+    # Universal VBA / stdole / MSForms intrinsic type & enum names that are
+    # not part of every host model but are always available in the VBA
+    # runtime. Keeps VBA120 quiet on these regardless of which `--host`
+    # model (if any) is loaded.
+    _INTRINSIC_TYPE_NAMES = {
+        # VBA.* intrinsic enums
+        "vbtristate", "vbcomparemethod", "vbcalltype", "vbdayofweek",
+        "vbfirstweekofyear", "vbvartype", "vbmsgboxresult", "vbmsgboxstyle",
+        "vbfileattribute", "vbappwinstyle", "vbstrconv", "vbqueryclose",
+        "vbimestatus",
+        # stdole picture / font / colour types
+        "ole_color", "ole_handle", "ole_tristate", "ole_optexclusive",
+        "ole_cancelbool", "ole_enabledefaultbool",
+        "ole_xpos_pixels", "ole_ypos_pixels", "ole_xsize_pixels", "ole_ysize_pixels",
+        "ole_xpos_himetric", "ole_ypos_himetric", "ole_xsize_himetric", "ole_ysize_himetric",
+        "ole_xpos_container", "ole_ypos_container", "ole_xsize_container", "ole_ysize_container",
+        "font", "ifont", "ifontdisp", "stdfont",
+        "picture", "ipicture", "ipicturedisp", "stdpicture",
+        # MSForms / VB form base types
+        "form", "userform", "control", "frame", "page", "msforms",
+    }
+
+    def _is_known_type(self, type_name):
+        """True if `type_name` resolves to a built-in, a source-declared
+        UDT/Enum, a class/form module, a host-model class/enum, or a
+        library-qualified name. Used by VBA120; deliberately lenient on
+        dotted/qualified names to avoid false positives on un-modelled hosts.
+        """
+        if not type_name:
+            return True
+        t = type_name.strip()
+        if t.endswith('()'):
+            t = t[:-2].strip()
+        if '*' in t:  # fixed-length string `String * N`
+            t = t.split('*')[0].strip()
+        if not t:
+            return True
+        low = t.lower()
+        if low in self._BUILTIN_TYPE_NAMES or low in self._INTRINSIC_TYPE_NAMES:
+            return True
+        if low in self.udts:
+            return True
+        if self._is_class_type(t) or self._is_enum_type(t):
+            return True
+        if '.' in t:
+            # Library-qualified (`Scripting.Dictionary`, `Excel.Range`): check
+            # the trailing segment, else accept — we don't model every host.
+            tail = t.rpartition('.')[2]
+            if self._is_known_type(tail):
+                return True
+            return True
+        sym = self.global_scope.resolve(t)
+        if sym and (sym.get('kind') or '').lower() in ('type', 'class', 'enum', 'library', 'module', 'form'):
+            return True
+        for m in self.modules:
+            if m.name.lower() == low:
+                return True
+        return False
+
+    def _check_type_known(self, type_name, line, filename, context):
+        """VBA120 — emit an 'undefined type' error if `type_name` is unknown."""
+        if self._is_known_type(type_name):
+            return
+        base = (type_name or '').replace('()', '').split('*')[0].strip()
+        self.errors.append({
+            "file": filename,
+            "line": line or 0,
+            "rule_id": "VBA120",
+            # Warning, not error: with an incomplete host model we cannot be
+            # certain an unresolved name is a typo vs. an un-modelled host
+            # type, so VBA120 surfaces the risk without gating compile-safety.
+            "severity": "warning",
+            "message": (
+                f"User-defined type '{base}' is not defined (in {context}). "
+                f"If it is a host type, load the matching model with `--host`."
+            ),
+        })
+
+    def _validate_object_module_members(self, mod):
+        """VBA370 — constants, arrays and Declare statements may not be Public
+        members of an object module (Class / Form). Such members are only
+        legal in standard modules."""
+        if mod.module_type not in ('Class', 'Form'):
+            return
+        public_scopes = ('public', 'global')
+        for var in mod.variables:
+            if getattr(var, 'is_enum_member', False):
+                continue
+            if (var.scope or '').lower() not in public_scopes:
+                continue
+            kind = None
+            if getattr(var, 'is_const', False):
+                kind = "constant"
+            elif (var.type_name or '').endswith('()'):
+                kind = "array"
+            if kind:
+                self.errors.append({
+                    "file": mod.filename, "line": 0,
+                    "rule_id": "VBA370", "severity": "error",
+                    "message": (
+                        f"Public {kind} '{var.name}' is not allowed as a member of "
+                        f"object module '{mod.name}'. Use a standard module, or make "
+                        f"it Private."
+                    ),
+                })
+        for proc in mod.procedures:
+            if getattr(proc, 'is_declare', False) and (proc.scope or '').lower() in public_scopes:
+                self.errors.append({
+                    "file": mod.filename, "line": getattr(proc, 'line', 0) or 0,
+                    "rule_id": "VBA370", "severity": "error",
+                    "message": (
+                        f"Public Declare '{proc.name}' is not allowed in object module "
+                        f"'{mod.name}'. Declare statements in a class must be Private."
+                    ),
+                })
+
+    def _validate_declared_types(self, mod):
+        """Phase 1.6 — VBA120/122/123: resolve declared type names and reject
+        empty Type/Enum blocks."""
+        for tname, udt in mod.types.items():
+            is_enum = getattr(udt, 'is_enum', False)
+            if not udt.members:
+                self.errors.append({
+                    "file": mod.filename, "line": 0,
+                    "rule_id": "VBA123" if is_enum else "VBA122",
+                    "severity": "error",
+                    "message": (
+                        f"Enum '{tname}' has no members; an empty Enum is not allowed."
+                        if is_enum else
+                        f"Type '{tname}' has no members; a user-defined type must "
+                        f"declare at least one member."
+                    ),
+                })
+            elif not is_enum:
+                for m in udt.members:
+                    self._check_type_known(m.type_name, 0, mod.filename, f"Type {tname}")
+
+        for var in mod.variables:
+            if not getattr(var, 'is_enum_member', False):
+                self._check_type_known(var.type_name, 0, mod.filename, f"module '{mod.name}'")
+
+        for proc in mod.procedures:
+            line = getattr(proc, 'line', 0)
+            for arg in (proc.args or []):
+                self._check_type_known(arg.type_name, line, mod.filename,
+                                       f"{proc.proc_type} '{proc.name}'")
+            pt = (proc.proc_type or '').lower()
+            if pt.startswith('function') or pt == 'property get':
+                self._check_type_known(proc.return_type, line, mod.filename,
+                                       f"{proc.proc_type} '{proc.name}'")
+
     def _split_assignment(self, tokens):
         """If `tokens` is an assignment, return (lhs_tokens, eq_index, rhs_tokens, has_set).
         Otherwise return None.
@@ -767,6 +1176,16 @@ class Analyzer:
         # skip those to avoid false positives.
         if not lhs or lhs[0].type != 'IDENTIFIER':
             return
+
+        # VBA164 — `Me` is read-only; it can never be an assignment target.
+        if lhs[0].value.lower() == 'me' and (len(lhs) == 1):
+            self.errors.append({
+                "file": filename, "line": lhs[0].line,
+                "rule_id": "VBA164", "severity": "error",
+                "message": f"Invalid use of Me keyword: cannot assign to Me in '{context}'.",
+            })
+            return
+
         is_bare = len(lhs) == 1
         is_dotted_chain = (
             not is_bare
@@ -785,7 +1204,21 @@ class Analyzer:
         kind_l = (kind or "").lower()
         if kind_l in self._CALLABLE_KINDS:
             return
-        if kind_l in ("enumitem", "type", "class", "property"):
+
+        # VBA160 — assigning to a constant or an Enum member is illegal.
+        if kind_l in ("const", "enumitem"):
+            what = "constant" if kind_l == "const" else "Enum member"
+            self.errors.append({
+                "file": filename, "line": lhs[0].line,
+                "rule_id": "VBA160", "severity": "error",
+                "message": (
+                    f"Assignment to {what} '{''.join(t.value for t in lhs)}' is not "
+                    f"permitted in '{context}'."
+                ),
+            })
+            return
+
+        if kind_l in ("type", "class", "property"):
             return
 
         line = lhs[0].line
@@ -898,6 +1331,24 @@ class Analyzer:
                 if node.tokens and node.tokens[0].value.lower() == 'exit':
                     if len(node.tokens) > 1:
                         exit_kind = node.tokens[1].value.lower()
+                        # VBA170/171 — `Exit For` / `Exit Do` only valid inside
+                        # the matching loop kind.
+                        if exit_kind == 'for' and 'for' not in getattr(self, '_loop_stack', []):
+                            self.errors.append({
+                                "file": filename,
+                                "line": node.tokens[0].line,
+                                "rule_id": "VBA170",
+                                "severity": "error",
+                                "message": f"Exit For is not within a For...Next loop in '{context}'.",
+                            })
+                        elif exit_kind == 'do' and 'do' not in getattr(self, '_loop_stack', []):
+                            self.errors.append({
+                                "file": filename,
+                                "line": node.tokens[0].line,
+                                "rule_id": "VBA171",
+                                "severity": "error",
+                                "message": f"Exit Do is not within a Do...Loop in '{context}'.",
+                            })
                         if exit_kind in ('sub', 'function', 'property'):
                             # Verify against context
                             # Resolve context in parent scope
@@ -972,7 +1423,64 @@ class Analyzer:
                 # and recursively walk the body.
                 if node.header_tokens:
                     self.analyze_statement(node.header_tokens, scope, filename, context, with_stack)
+
+                var_name = node.var_token.value if node.var_token else None
+                var_key = var_name.lower() if var_name else None
+
+                # VBA173 — the same control variable is already driving an
+                # enclosing For loop in this procedure.
+                if var_key and var_key in getattr(self, '_for_var_stack', []):
+                    self.errors.append({
+                        "file": filename,
+                        "line": getattr(node, 'line', 0) or (node.var_token.line if node.var_token else 0),
+                        "rule_id": "VBA173",
+                        "severity": "error",
+                        "message": (
+                            f"For loop control variable '{var_name}' is already in "
+                            f"use by an enclosing loop in '{context}'."
+                        ),
+                    })
+
+                # VBA174 — `For Each` control variable must be Variant or an
+                # object type; primitive scalar counters are illegal.
+                if node.kind == 'each' and var_name:
+                    sym = scope.resolve(var_name)
+                    vtype = sym.get('type') if sym else None
+                    if vtype and self._is_clearly_scalar(vtype):
+                        self.errors.append({
+                            "file": filename,
+                            "line": node.var_token.line,
+                            "rule_id": "VBA174",
+                            "severity": "error",
+                            "message": (
+                                f"For Each control variable '{var_name}' is typed "
+                                f"'{vtype}'; it must be Variant or an object type."
+                            ),
+                        })
+
+                # VBA172 — closing `Next x` names a variable other than this
+                # loop's counter (skip the multi-close `Next j, i` form).
+                if (node.kind == 'counter' and var_key and node.next_var_token
+                        and not node.next_multi
+                        and node.next_var_token.value.lower() != var_key):
+                    self.errors.append({
+                        "file": filename,
+                        "line": node.next_var_token.line,
+                        "rule_id": "VBA172",
+                        "severity": "error",
+                        "message": (
+                            f"Next control variable '{node.next_var_token.value}' does "
+                            f"not match the For counter '{var_name}' in '{context}'."
+                        ),
+                    })
+
+                self._loop_stack.append('for')
+                if var_key:
+                    self._for_var_stack.append(var_key)
                 self.analyze_block(node.body, scope, filename, context, with_stack)
+                if var_key:
+                    self._for_var_stack.pop()
+                self._loop_stack.pop()
 
             elif isinstance(node, DoNode):
                 # Do [While|Until cond] / Do … Loop While|Until / While … Wend
@@ -984,7 +1492,13 @@ class Analyzer:
                 pos = getattr(node, 'condition_position', 'top')
                 if pos == 'top' and node.condition_tokens:
                     self.analyze_statement(node.condition_tokens, scope, filename, context, with_stack)
+                # `Exit Do` is only valid inside a real Do...Loop, not While...Wend.
+                pushed_do = getattr(node, 'kind', 'do') == 'do'
+                if pushed_do:
+                    self._loop_stack.append('do')
                 self.analyze_block(node.body, scope, filename, context, with_stack)
+                if pushed_do:
+                    self._loop_stack.pop()
                 if pos == 'bottom' and node.condition_tokens:
                     self.analyze_statement(node.condition_tokens, scope, filename, context, with_stack)
 
@@ -1343,10 +1857,12 @@ class Analyzer:
             if t.type == 'IDENTIFIER':
                 if t.value.lower() == 'as':
                     explicit_as = True
+                    saw_new = False
                     i += 1
                     type_parts = []
                     while i < len(tokens_list):
                         if tokens_list[i].value.lower() == 'new':
+                            saw_new = True
                             i += 1
                             continue
                         
@@ -1363,6 +1879,40 @@ class Analyzer:
                     current_type = "".join(type_parts)
                     if is_array:
                         current_type += "()"
+
+                    # Phase 1.6 — VBA120: resolve the declared local type.
+                    self._check_type_known(current_type, t.line, filename, context)
+
+                    # VBA270 — a type-declaration suffix on the name must agree
+                    # with the `As` type (`Dim x% As Long` is illegal). Only the
+                    # $ / % / @ suffixes survive lexing as part of the identifier.
+                    if current_name and current_name[-1] in self._TYPE_SUFFIX_MAP:
+                        sfx_type = self._TYPE_SUFFIX_MAP[current_name[-1]]
+                        base_ct = current_type.replace('()', '').split('*')[0].strip().lower()
+                        if base_ct and base_ct != sfx_type:
+                            self.errors.append({
+                                "file": filename, "line": t.line,
+                                "rule_id": "VBA270", "severity": "error",
+                                "message": (
+                                    f"Type-declaration character on '{current_name}' "
+                                    f"implies {sfx_type.capitalize()} but it is declared "
+                                    f"As {current_type} in '{context}'."
+                                ),
+                            })
+
+                    # VBA165 — `New` requires a creatable class; `As New
+                    # <primitive/Object/Variant>` is illegal.
+                    if saw_new:
+                        base = current_type.replace('()', '').split('*')[0].strip()
+                        if base.lower() in self._BUILTIN_TYPE_NAMES:
+                            self.errors.append({
+                                "file": filename, "line": t.line,
+                                "rule_id": "VBA165", "severity": "error",
+                                "message": (
+                                    f"Invalid use of New keyword: '{base}' is not a "
+                                    f"creatable class in '{context}'."
+                                ),
+                            })
 
                     # Phase 2.8 — Fixed-length String only valid at module
                     # level (or inside UDTs). `Dim s As String * 10` inside
@@ -1958,6 +2508,68 @@ class Analyzer:
              args.append(current_arg)
         return args
 
+    @staticmethod
+    def _param_name(p):
+        if isinstance(p, dict):
+            return (p.get('name') or '').lower() or None
+        return (getattr(p, 'name', '') or '').lower() or None
+
+    @staticmethod
+    def _param_is_paramarray(p):
+        if isinstance(p, dict):
+            return bool(p.get('is_paramarray', False))
+        return bool(getattr(p, 'is_paramarray', False))
+
+    def _validate_named_args(self, args, param_defs, name, filename, line, context,
+                             is_source_proc=False):
+        """VBA140/141/142 — validate `name:=value` call arguments.
+
+        - VBA141 (duplicate) is purely syntactic.
+        - VBA140 (unknown name) only fires for scanned-source procedures
+          (`is_source_proc`) whose parameter names are authoritative. Host-
+          model parameter names are advisory (they can abbreviate or rename
+          the real API, e.g. `Range.Find(What:=…)`), so VBA140 is suppressed
+          for them to avoid false positives.
+        - VBA142 — a procedure with a ParamArray cannot be called with named
+          arguments.
+        """
+        param_names = {self._param_name(p) for p in (param_defs or [])}
+        param_names.discard(None)
+        has_param_array = any(self._param_is_paramarray(p) for p in (param_defs or []))
+        all_named = is_source_proc and bool(param_defs) and all(
+            self._param_name(p) for p in param_defs)
+
+        seen = set()
+        any_named = False
+        for arg in args:
+            if (len(arg) >= 2 and arg[0].type == 'IDENTIFIER'
+                    and arg[1].type == 'OPERATOR' and arg[1].value == ':='):
+                any_named = True
+                nm = arg[0].value
+                low = nm.lower()
+                if low in seen:
+                    self.errors.append({
+                        "file": filename, "line": line,
+                        "rule_id": "VBA141", "severity": "error",
+                        "message": f"Named argument '{nm}' specified more than once in call to '{name}'.",
+                    })
+                seen.add(low)
+                if all_named and low not in param_names:
+                    self.errors.append({
+                        "file": filename, "line": line,
+                        "rule_id": "VBA140", "severity": "error",
+                        "message": f"Named argument '{nm}' not found in '{name}'.",
+                    })
+
+        if any_named and has_param_array:
+            self.errors.append({
+                "file": filename, "line": line,
+                "rule_id": "VBA142", "severity": "error",
+                "message": (
+                    f"'{name}' has a ParamArray and cannot be called with named arguments."
+                ),
+            })
+
     def validate_signature(self, name, symbol, arg_tokens, filename, line, context, scope=None, with_stack=None):
         extra = symbol.get('extra')
         if not extra: return
@@ -1999,6 +2611,13 @@ class Analyzer:
              max_args = extra.get('max_args', 999)
              if 'args' in extra:
                  param_defs = extra['args']
+
+        # Phase 2.9 — named-argument validation (VBA140/141/142). VBA140
+        # (unknown name) only for scanned-source procedures whose parameter
+        # names are authoritative; host-model param names are advisory.
+        self._validate_named_args(
+            args, param_defs, name, filename, line, context,
+            is_source_proc=isinstance(extra, ProcedureNode))
 
         if arg_count < min_args:
              self.errors.append({

@@ -48,6 +48,7 @@ class ProcedureNode(Node):
         self.args = [] # List of VariableNode
         self.locals = [] # List of VariableNode
         self.body = [] # List of nodes (StatementNode, WithNode)
+        self.line = 0 # 1-based source line of the declaration (diagnostics)
 
     def __repr__(self):
         decl = "Declare " if self.is_declare else ""
@@ -100,12 +101,18 @@ class IfNode(Node):
 
 class ForNode(Node):
     """For i = a To b [Step c]    OR    For Each x In coll"""
-    def __init__(self, kind, var_token, header_tokens, body, line=0):
+    def __init__(self, kind, var_token, header_tokens, body, line=0,
+                 next_var_token=None, next_multi=False):
         self.kind = kind            # 'counter' | 'each'
         self.var_token = var_token  # Token for the loop variable name (may be None)
         self.header_tokens = header_tokens
         self.body = body
         self.line = line
+        # Optional control variable on the closing `Next i` (None for bare
+        # `Next`). `next_multi` flags the `Next j, i` multi-close form, where
+        # the variable need not match this loop's counter.
+        self.next_var_token = next_var_token
+        self.next_multi = next_multi
 
 
 class DoNode(Node):
@@ -174,6 +181,10 @@ class VBAParser:
         self.pos = 0
         self.current_token = None
         self.errors = []  # collected syntax errors (dicts)
+        # `Next j, i` closes several nested For loops at once. The innermost
+        # parse_for consumes the whole list and records how many *enclosing*
+        # loops it also closed here, so those loops don't misfire VBA110.
+        self._pending_next_closes = 0
         self.advance()
 
     def _record_syntax_error(self, message, line=None, rule_id="VBA_SYN001"):
@@ -214,7 +225,11 @@ class VBAParser:
 
     def parse_module(self):
         module = ModuleNode("Unknown")
-        
+        # VBA182 — DefXxx statements must precede every variable / constant /
+        # procedure / type declaration. Flips once the first such declaration
+        # is parsed at module scope.
+        self._module_decl_seen = False
+
         while self.current_token.type != 'EOF':
             if self.match('IDENTIFIER', 'Attribute'):
                 self.parse_attribute(module)
@@ -238,12 +253,16 @@ class VBAParser:
             ):
                 self._parse_def_type(module)
             elif self.match('IDENTIFIER', 'Public') or self.match('IDENTIFIER', 'Private') or self.match('IDENTIFIER', 'Friend') or self.match('IDENTIFIER', 'Dim') or self.match('IDENTIFIER', 'Const') or self.match('IDENTIFIER', 'Global'):
+                self._module_decl_seen = True
                 self.parse_declaration(module)
             elif self.match('IDENTIFIER', 'Sub') or self.match('IDENTIFIER', 'Function') or self.match('IDENTIFIER', 'Property'):
-                self.procedures_parse(module, 'Public') 
+                self._module_decl_seen = True
+                self.procedures_parse(module, 'Public')
             elif self.match('IDENTIFIER', 'Type'):
+                self._module_decl_seen = True
                 self.parse_udt(module)
             elif self.match('IDENTIFIER', 'Event'):
+                self._module_decl_seen = True
                 # Handle implicit public Event
                 self.consume() # Event
                 event_name = "Unknown"
@@ -258,6 +277,7 @@ class VBAParser:
                 module.procedures.append(proc)
 
             elif self.match('IDENTIFIER', 'Enum'):
+                self._module_decl_seen = True
                 self.parse_enum(module, 'Public')
             elif self.match('NEWLINE'):
                 self.advance()
@@ -331,6 +351,23 @@ class VBAParser:
             ),
         })
 
+    def _is_misplaced_statement_in_typelike(self):
+        """Heuristic for VBA180/VBA181 — detect a statement wrongly placed
+        inside a `Type`/`Enum` block.
+
+        A valid member is `Name As Type`, `Name(dims) As …`, `Name = value`
+        (Enum) or a bare `Name`. VBA is permissive about member names — many
+        keywords (`Type`, `Name`, `Date`, …) are legal field names — so we do
+        NOT match on a keyword blacklist. Instead we use the declaration
+        *shape*: a line that starts with two consecutive identifiers where the
+        second is not `As` (e.g. `Dim x …`, `Sub Foo`, `Static y`, `Set a`)
+        cannot be a member declaration and is therefore a misplaced statement.
+        """
+        if self.current_token.type != 'IDENTIFIER':
+            return False
+        nxt = self.peek()
+        return nxt.type == 'IDENTIFIER' and nxt.value.lower() != 'as'
+
     _DEFTYPE_TO_TYPE = {
         'defbool': 'Boolean', 'defbyte': 'Byte', 'defint': 'Integer',
         'deflng': 'Long', 'deflnglng': 'LongLong', 'deflngptr': 'LongPtr',
@@ -341,10 +378,18 @@ class VBAParser:
 
     def _parse_def_type(self, module):
         """Parse `DefInt A-K, X` etc. and update module.def_type_map."""
+        def_line = self.current_token.line
         keyword = self.current_token.value.lower()
         target_type = self._DEFTYPE_TO_TYPE.get(keyword, 'Variant')
         self.advance()  # consume DefXxx
 
+        # VBA182 — DefXxx must precede all declarations.
+        if getattr(self, '_module_decl_seen', False):
+            self._record_syntax_error(
+                "Compile error: Deftype statements must precede declarations",
+                line=def_line, rule_id="VBA182")
+
+        dup_reported = False
         while self.current_token.type not in ('NEWLINE', 'EOF'):
             if self.current_token.type == 'IDENTIFIER' and len(self.current_token.value) >= 1:
                 first = self.current_token.value[0].lower()
@@ -360,7 +405,15 @@ class VBAParser:
                     lo = min(ord(first), ord(last))
                     hi = max(ord(first), ord(last))
                     for code in range(lo, hi + 1):
-                        module.def_type_map[chr(code)] = target_type
+                        letter = chr(code)
+                        # VBA183 — a letter already covered by a previous
+                        # DefXxx statement is a duplicate definition.
+                        if letter in module.def_type_map and not dup_reported:
+                            self._record_syntax_error(
+                                "Compile error: Duplicate definition (Deftype letter range overlaps)",
+                                line=def_line, rule_id="VBA183")
+                            dup_reported = True
+                        module.def_type_map[letter] = target_type
             elif self.match('OPERATOR', ','):
                 self.advance()
             else:
@@ -369,12 +422,24 @@ class VBAParser:
 
     def _parse_option(self, module):
         """Parse `Option Explicit | Compare {Binary|Text|Database} | Base N | Private Module`."""
+        opt_line = self.current_token.line
         self.advance()  # consume 'Option'
         if self.current_token.type != 'IDENTIFIER':
             self.consume_statement()
             return
         kind = self.current_token.value.lower()
         self.advance()
+        # VBA184 — the same Option statement must not appear twice.
+        already = (
+            (kind == 'explicit' and module.options.get('explicit'))
+            or (kind == 'compare' and module.options.get('compare') is not None)
+            or (kind == 'base' and getattr(module, '_option_base_seen', False))
+            or (kind == 'private' and module.options.get('private_module'))
+        )
+        if already:
+            self._record_syntax_error(
+                f"Compile error: Duplicate Option statement (Option {kind.capitalize()})",
+                line=opt_line, rule_id="VBA184")
         if kind == 'explicit':
             module.options['explicit'] = True
         elif kind == 'compare':
@@ -382,6 +447,7 @@ class VBAParser:
                 module.options['compare'] = self.current_token.value.lower()
                 self.advance()
         elif kind == 'base':
+            module._option_base_seen = True
             if self.current_token.type == 'INTEGER':
                 try:
                     module.options['base'] = int(self.current_token.value)
@@ -457,11 +523,13 @@ class VBAParser:
         if self.match('IDENTIFIER', 'Event'):
             self.advance()
             event_name = "Unknown"
+            event_name_line = self.current_token.line
             if self.current_token.type == 'IDENTIFIER':
                 event_name = self.current_token.value
                 self.advance()
 
             proc = ProcedureNode(event_name, 'Event', scope=scope)
+            proc.line = event_name_line
 
             if self.match('OPERATOR', '('):
                 self.parse_arg_list(proc)
@@ -517,6 +585,7 @@ class VBAParser:
                 is_ptrsafe=is_ptrsafe,
             )
             proc.declare_line = declare_line  # used for diagnostics
+            proc.line = declare_line
 
             # Args (...)
             if self.match('OPERATOR', '('):
@@ -547,7 +616,13 @@ class VBAParser:
 
         # Check if Const
         is_const = False
-        if scope.lower() in ('public', 'private', 'global', 'friend'):
+        if scope.lower() == 'const':
+            # Bare module-level `Const X = …` (no Public/Private prefix). The
+            # `Const` keyword was consumed as `scope`; default the real scope
+            # to Private (VBA's default for an unqualified module constant).
+            is_const = True
+            scope = 'Private'
+        elif scope.lower() in ('public', 'private', 'global', 'friend'):
              if self.match('IDENTIFIER', 'Const'):
                  is_const = True
                  self.advance()
@@ -612,19 +687,21 @@ class VBAParser:
         return "".join(type_parts)
 
     def procedures_parse(self, module, scope):
-        proc_type = self.current_token.value 
+        proc_line = self.current_token.line
+        proc_type = self.current_token.value
         self.advance()
-        
+
         if self.match('IDENTIFIER', 'Get') or self.match('IDENTIFIER', 'Let') or self.match('IDENTIFIER', 'Set'):
             proc_type += " " + self.current_token.value
             self.advance()
-            
+
         proc_name = "Unknown"
         if self.current_token.type == 'IDENTIFIER':
             proc_name = self.current_token.value
             self.advance()
-            
+
         proc = ProcedureNode(proc_name, proc_type, scope=scope)
+        proc.line = proc_line
         
         # Args
         if self.match('OPERATOR', '('):
@@ -644,12 +721,14 @@ class VBAParser:
         # occasionally close a Function with `End Sub` (or vice versa);
         # VBE rejects this at compile time. Surface it as VBA350 so the
         # mismatch is caught before VBE ever sees it.
+        consumed_end = False
         if self.match('IDENTIFIER', 'End'):
              end_line = self.current_token.line
              self.advance()
              actual = self.current_token.value.lower() if self.current_token.type == 'IDENTIFIER' else None
              if actual == end_marker:
                  self.advance()
+                 consumed_end = True
              elif actual in ('sub', 'function', 'property'):
                  # Wrong terminator keyword (`End Sub` closing a Function
                  # etc.). Consume it so recovery continues cleanly.
@@ -666,6 +745,20 @@ class VBAParser:
                      ),
                  })
                  self.advance()
+
+        # VBA151 — only comments may follow `End Sub/Function/Property`.
+        if consumed_end:
+            while self.current_token.type not in ('NEWLINE', 'EOF'):
+                if self.current_token.type == 'COMMENT':
+                    break
+                if self.current_token.type == 'OPERATOR' and self.current_token.value == ':':
+                    self.advance()
+                    continue
+                self._record_syntax_error(
+                    "Compile error: Only comments may appear after End Sub, "
+                    "End Function, or End Property",
+                    line=self.current_token.line, rule_id="VBA151")
+                break
         self.consume_statement()
 
         module.procedures.append(proc)
@@ -710,12 +803,20 @@ class VBAParser:
                     # If marker is "Else", and we have "Else", it's a match.
                     return nodes
 
-                # VALIDATION: Check for unexpected block terminators
-                if val in ('next', 'loop', 'else', 'elseif', 'wend'):
-                    # Found a block keyword that was NOT in end_markers -> Unexpected
-                    self._record_syntax_error(
-                        f"Syntax Error: Unexpected '{self.current_token.value}'."
-                    )
+                # VALIDATION: Check for unexpected block terminators. These
+                # are the *inverse* of the missing-terminator checks in the
+                # individual block parsers: here a terminator appears with no
+                # matching opener in scope.
+                _INVERSE_TERMINATORS = {
+                    'next': ("Compile error: Next without For", "VBA116"),
+                    'loop': ("Compile error: Loop without Do", "VBA117"),
+                    'wend': ("Compile error: Wend without While", "VBA118"),
+                    'else': ("Compile error: Else without If", "VBA119"),
+                    'elseif': ("Compile error: ElseIf without If", "VBA119"),
+                }
+                if val in _INVERSE_TERMINATORS:
+                    msg, rid = _INVERSE_TERMINATORS[val]
+                    self._record_syntax_error(msg, rule_id=rid)
                     # We consume it to avoid infinite loop, but it's an error
                     self.consume_statement()
                     continue
@@ -725,7 +826,8 @@ class VBAParser:
                     if peek_val in ('if', 'select', 'with', 'function', 'sub', 'property'):
                         # Found End X that was NOT in end_markers -> Unexpected
                         self._record_syntax_error(
-                            f"Syntax Error: Unexpected 'End {self.peek().value}'."
+                            f"Compile error: End {self.peek().value} without matching block statement",
+                            rule_id="VBA119",
                         )
                         self.advance() # End
                         self.advance() # X
@@ -742,7 +844,11 @@ class VBAParser:
             
             elif self.match('IDENTIFIER', 'For'):
                 nodes.append(self.parse_for())
-            
+                # A nested `Next j, i` closed this loop too; stop the body here
+                # and let the enclosing parse_for account for the close.
+                if self._pending_next_closes > 0:
+                    return nodes
+
             elif self.match('IDENTIFIER', 'Do'):
                 nodes.append(self.parse_do())
                 
@@ -792,7 +898,9 @@ class VBAParser:
 
         body = self.parse_block(end_markers=["Wend"])
 
-        self.consume('IDENTIFIER', 'Wend')
+        if not self.consume('IDENTIFIER', 'Wend'):
+            self._record_syntax_error(
+                "Compile error: While without Wend", line=line, rule_id="VBA112")
         self.consume_statement()
 
         return DoNode(
@@ -804,25 +912,29 @@ class VBAParser:
         )
 
     def parse_with(self):
+        line = self.current_token.line
         self.consume('IDENTIFIER', 'With')
         expr_tokens = []
         while self.current_token.type not in ('NEWLINE', 'EOF'):
             expr_tokens.append(self.current_token)
             self.advance()
         self.consume_statement()
-        
+
         body = self.parse_block(end_markers=["End With"])
-        
-        self.consume('IDENTIFIER', 'End')
-        self.consume('IDENTIFIER', 'With')
-        self.consume_statement()
-        
+
+        if not self.consume('IDENTIFIER', 'End') or not self.consume('IDENTIFIER', 'With'):
+            self._record_syntax_error(
+                "Compile error: Expected End With", line=line, rule_id="VBA113")
+        else:
+            self.consume_statement()
+
         return WithNode(expr_tokens, body)
 
     def parse_if_stmt(self):
         # If <condition> Then <newline> [Block]
         # If <condition> Then <statement> [Else <statement>] [newline] [Single Line]
-        
+
+        if_line = self.current_token.line
         self.consume('IDENTIFIER', 'If')
         
         # Scavenge tokens until 'Then'
@@ -854,12 +966,13 @@ class VBAParser:
              
              else_blocks = []
              else_block = None
-             
+             end_if_seen = False
+
              while True:
                  tok = self.current_token
                  if tok.type == 'IDENTIFIER':
                      val = tok.value.lower()
-                     
+
                      if val == 'elseif':
                          self.advance()
                          # Parse condition Then
@@ -886,13 +999,19 @@ class VBAParser:
                              self.advance() # End
                              self.advance() # If
                              self.consume_statement()
+                             end_if_seen = True
                          break
-                     
+
                      else:
                          break
                  else:
                      break
-             
+
+             if not end_if_seen:
+                 self._record_syntax_error(
+                     "Compile error: Block If without End If",
+                     line=if_line, rule_id="VBA115")
+
              return IfNode(condition_tokens, true_block, else_blocks, else_block)
              
         else:
@@ -966,10 +1085,31 @@ class VBAParser:
 
         body = self.parse_block(end_markers=["Next"])
 
-        self.consume('IDENTIFIER', 'Next')
-        # Optional variable name after Next (`Next i`).
-        if self.current_token.type == 'IDENTIFIER':
+        next_var_token = None
+        next_multi = False
+        if not self.consume('IDENTIFIER', 'Next'):
+            # An enclosing loop's `Next j, i` may already have closed this one.
+            if self._pending_next_closes > 0:
+                self._pending_next_closes -= 1
+            else:
+                self._record_syntax_error(
+                    "Compile error: For without Next", line=line, rule_id="VBA110")
+        elif self.current_token.type == 'IDENTIFIER':
+            # Optional variable name after Next (`Next i`).
+            next_var_token = self.current_token
             self.advance()
+            # `Next j, i [, ...]` closes several nested loops on one line. Each
+            # extra name closes one enclosing loop; record that so those
+            # parse_for frames don't report a missing Next.
+            extra_closes = 0
+            while self.match('OPERATOR', ','):
+                next_multi = True
+                self.advance()  # consume ','
+                if self.current_token.type == 'IDENTIFIER':
+                    extra_closes += 1
+                    self.advance()
+            if extra_closes:
+                self._pending_next_closes += extra_closes
         self.consume_statement()
 
         return ForNode(
@@ -978,6 +1118,8 @@ class VBAParser:
             header_tokens=header_tokens,
             body=body,
             line=line,
+            next_var_token=next_var_token,
+            next_multi=next_multi,
         )
 
     def parse_do(self):
@@ -1001,7 +1143,9 @@ class VBAParser:
 
         body = self.parse_block(end_markers=["Loop"])
 
-        self.consume('IDENTIFIER', 'Loop')
+        if not self.consume('IDENTIFIER', 'Loop'):
+            self._record_syntax_error(
+                "Compile error: Do without Loop", line=line, rule_id="VBA111")
         # Optional bottom-tested condition: Loop While <cond>  /  Loop Until <cond>
         if self.match('IDENTIFIER', 'While') or self.match('IDENTIFIER', 'Until'):
             self.advance()
@@ -1072,9 +1216,12 @@ class VBAParser:
                 )
                 self.consume_statement()
 
-        self.consume('IDENTIFIER', 'End')
-        self.consume('IDENTIFIER', 'Select')
-        self.consume_statement()
+        if not self.consume('IDENTIFIER', 'End') or not self.consume('IDENTIFIER', 'Select'):
+            self._record_syntax_error(
+                "Compile error: Select Case without End Select",
+                line=line, rule_id="VBA114")
+        else:
+            self.consume_statement()
 
         return SelectNode(expr_tokens=expr_tokens, cases=cases, line=line)
 
@@ -1362,7 +1509,15 @@ class VBAParser:
                 self.advance() # Type
                 self.consume_statement()
                 break
-            
+
+            # VBA181 — a statement wrongly placed inside a Type block.
+            if self._is_misplaced_statement_in_typelike():
+                self._record_syntax_error(
+                    "Compile error: Statement invalid inside Type block",
+                    line=self.current_token.line, rule_id="VBA181")
+                self.consume_statement()
+                continue
+
             # Parse Member: Name [(dims)] As Type [* length]
             if self.current_token.type == 'IDENTIFIER':
                 var_name = self.current_token.value
@@ -1415,6 +1570,14 @@ class VBAParser:
                 self.advance()
                 self.consume_statement()
                 break
+
+            # VBA180 — a statement wrongly placed inside an Enum block.
+            if self._is_misplaced_statement_in_typelike():
+                self._record_syntax_error(
+                    "Compile error: Statement invalid inside Enum block",
+                    line=self.current_token.line, rule_id="VBA180")
+                self.consume_statement()
+                continue
 
             # Member: Name = Value
             if self.current_token.type == 'IDENTIFIER':
