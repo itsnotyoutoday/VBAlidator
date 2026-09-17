@@ -135,6 +135,24 @@ worth knowing:
   would otherwise appear to have `Work`, `Cost` and `Text1..30` instead
   of its actual six members.
 
+Rebuilding it needs no Windows and no network:
+
+```bash
+python tools/build_project_model.py     # tools/data/*.json -> src/models/project.json
+```
+
+The two inputs under `tools/data/` are committed. To regenerate them from
+scratch, sparse-clone the docs source and re-extract:
+
+```bash
+git clone --filter=blob:none --no-checkout --depth 1 \
+    https://github.com/MicrosoftDocs/VBA-Docs.git
+cd VBA-Docs && git sparse-checkout init --no-cone \
+    && git sparse-checkout set '/api/project.*' '/project' && git checkout && cd ..
+python tools/extract_project_docs.py VBA-Docs
+```
+
+
 In addition, six companion stubs **auto-layer** without an explicit
 `--host` flag whenever any scanned file mentions their ProgID /
 namespace:

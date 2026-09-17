@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Extract the MS Project object model from MicrosoftDocs/VBA-Docs.
+
+That repository is the SOURCE of learn.microsoft.com/office/vba/api/project.* -
+the published pages are built from these markdown files - so parsing it gives
+the documented object model without a single name being typed by hand.
+
+Which matters, because a model is a WHITELIST: a name listed wrongly makes the
+analyser bless a typo, which is worse than having no model. A hand-transcribed
+first pass dropped Resource.UniqueID and Assignment.ResourceUniqueID and
+invented Resource.Generic, Resource.Inactive and nine pj* constants. None of
+those mistakes are possible here.
+
+It also sidesteps a real documentation bug. The project.assignments OBJECT page
+carries the Assignment object's member tables by mistake, every link pointing at
+project.assignment.* - read that page and you would swear the collection had
+Work, Cost and Text1..30. But there is no Project.Assignments.Work.md FILE, and
+this reads the member files. Six members, which is the truth.
+
+    usage: extract_project_docs.py <VBA-Docs clone> [-o tools/data/...]
+
+To get the clone without downloading all of Office (VBA-Docs covers every app):
+
+    git clone --filter=blob:none --no-checkout --depth 1 \\
+        https://github.com/MicrosoftDocs/VBA-Docs.git
+    cd VBA-Docs
+    git sparse-checkout init --no-cone
+    git sparse-checkout set '/api/project.*' '/project'
+    git checkout
+
+The extracted JSON is committed, so building the model afterwards needs neither
+the clone nor the network.
+
+WHAT THIS CANNOT SEE. Documentation describes the SUPPORTED API. A type library
+also carries hidden and legacy members, and Project.NewTasksAreManual is one:
+undocumented, absent from every page here, and real - code in the wild assigns
+to it from an early-bound Project variable, which could not compile otherwise.
+So this is authoritative for what is SUPPORTED, not for what exists; the
+build script carries such members as explicit exceptions.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+from collections import defaultdict
+
+# "# Task.UniqueID property (Project)" / "# Tasks object (Project)"
+H1 = re.compile(r"^#\s+(?P<name>[A-Za-z0-9_.]+)\s+"
+                r"(?P<kind>property|method|event|object|enumeration)\s+\(Project\)",
+                re.M)
+# "Read-only **Long**." / "Read/write **Variant**."
+PROPTYPE = re.compile(r"Read(?:-only|/write)\s+\*\*([A-Za-z0-9_]+)\*\*")
+RETURN = re.compile(r"^##\s*Return value\s*$(?P<body>.*?)(?=^##|\Z)", re.M | re.S)
+# One row of the Parameters table.
+PARAM = re.compile(r"^\|\s*_(?P<pname>\w+)_\s*\|\s*(?P<req>Required|Optional)",
+                   re.M | re.I)
+
+
+def parse(path):
+    text = open(path, encoding="utf-8", errors="replace").read()
+    m = H1.search(text)
+    if not m:
+        return None
+
+    name, kind = m.group("name"), m.group("kind")
+    out = {"kind": kind, "file": os.path.basename(path)}
+
+    if kind == "property":
+        t = PROPTYPE.search(text)
+        out["type"] = t.group(1) if t else None
+        # Properties CAN take arguments - Project.BaselineSavedDate does. Not
+        # assuming zero is the difference between checking a call and rejecting
+        # a valid one.
+        out["args"] = params(text)
+    elif kind == "method":
+        r = RETURN.search(text)
+        if r:
+            rt = re.search(r"\*\*([A-Za-z0-9_]+)\*\*", r.group("body"))
+            body = r.group("body").strip()
+            out["type"] = rt.group(1) if rt else ("Nothing" if "Nothing" in body else None)
+        else:
+            # No Return value section at all is how MS writes a Sub.
+            out["type"] = "Nothing"
+        out["args"] = params(text)
+    return name, out
+
+
+def params(text):
+    """(required, total) from the Parameters table, or (0, 0) when there isn't
+    one. Counts, not positions - and that is a real limitation: FilterEdit has
+    required arguments at positions 1, 2 and 9, so a count alone accepts three
+    arguments that Project would reject."""
+    rows = PARAM.findall(text)
+    if not rows:
+        return [0, 0]
+    req = sum(1 for _, r in rows if r.lower() == "required")
+    return [req, len(rows)]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("clone", help="path to a VBA-Docs clone")
+    ap.add_argument("-o", "--out", default=None)
+    args = ap.parse_args()
+
+    api = os.path.join(args.clone, "api")
+    if not os.path.isdir(api):
+        sys.exit(f"no api/ directory under {args.clone}")
+
+    root = ROOT
+    out_path = args.out or os.path.join(root, "tools", "data", "project_api.json")
+
+    classes = defaultdict(dict)
+    objects, events, skipped = {}, defaultdict(list), []
+
+    for fn in sorted(os.listdir(api)):
+        if not fn.lower().startswith("project.") or not fn.endswith(".md"):
+            continue
+        got = parse(os.path.join(api, fn))
+        if not got:
+            skipped.append(fn)
+            continue
+        name, info = got
+
+        if info["kind"] == "enumeration":
+            continue
+        if info["kind"] == "object":
+            # The H1 carries the canonical casing; filenames are inconsistent
+            # about it (both Project.Application.md and Project.application.md
+            # exist).
+            objects[name.lower()] = name
+            continue
+
+        if "." not in name:
+            skipped.append(fn)
+            continue
+        cls, member = name.rsplit(".", 1)
+        if info["kind"] == "event":
+            # Events are not callable members - modelling them as methods would
+            # make ActiveProject.Calculate look like a valid call.
+            events[cls].append(member)
+            continue
+        classes[cls][member] = {k: v for k, v in info.items() if k != "kind"} | {
+            "kind": info["kind"]}
+
+    data = {
+        "source": "github.com/MicrosoftDocs/VBA-Docs (api/project.*)",
+        "objects": objects,
+        "classes": {c: classes[c] for c in sorted(classes)},
+        "events": {c: sorted(v) for c, v in sorted(events.items())},
+    }
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w") as fh:
+        json.dump(data, fh, indent=1, sort_keys=True)
+        fh.write("\n")
+
+    total = sum(len(m) for m in classes.values())
+    print(f"wrote {out_path}")
+    print(f"  {len(classes)} classes with members, {total} members")
+    print(f"  {len(objects)} object pages, "
+          f"{sum(len(v) for v in events.values())} events (not modelled)")
+    if skipped:
+        print(f"  {len(skipped)} files with no parseable H1, e.g. {skipped[:3]}")
+    big = sorted(classes.items(), key=lambda kv: -len(kv[1]))[:8]
+    for c, m in big:
+        props = sum(1 for v in m.values() if v["kind"] == "property")
+        print(f"    {c:14} {len(m):4}  ({props} properties, {len(m)-props} methods)")
+    missing = [f"{c}.{n}" for c, m in classes.items()
+               for n, v in m.items() if not v.get("type")]
+    if missing:
+        print(f"  {len(missing)} members whose page states no type "
+              f"(kept as Variant by the builder): {missing[:5]}")
+
+
+if __name__ == "__main__":
+    main()
