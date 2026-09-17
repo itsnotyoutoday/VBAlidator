@@ -641,7 +641,7 @@ End Sub
 
 
 @pytest.mark.parametrize("host", [
-    "excel", "word", "access", "outlook", "visio",
+    "excel", "word", "access", "outlook", "visio", "project",
     "mscomctl", "msforms",
     "scripting", "vbscript_regexp", "wscript_shell", "shell_application",
 ])

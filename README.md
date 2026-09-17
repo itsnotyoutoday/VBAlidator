@@ -110,12 +110,30 @@ instead of crashing.
 
 ## Bundled host models & auto-layering
 
-`--host excel|word|access|outlook|visio` auto-loads the matching Office
-host model from `src/models/`. Excel/Word/Access/Visio are
+`--host excel|word|access|outlook|visio|project` auto-loads the matching
+Office host model from `src/models/`. Excel/Word/Access/Visio are
 **full-fidelity** exports of the real Office type libraries
 (1–3 MB each, ~1000 classes apiece, ~5000 globals/classes in
 Excel alone); Outlook is a hand-curated stub (the Trust-Center
 AccessVBOM path is GPO-blocked on managed installs).
+
+`project` covers MS Project: 103 classes, 2,925 members and all 4,907
+`pj*` constants from all 172 enumerations. It is generated from
+[MicrosoftDocs/VBA-Docs](https://github.com/MicrosoftDocs/VBA-Docs) — the
+repository the published `learn.microsoft.com/office/vba/api/project.*`
+pages are built from — rather than from a type library, because the
+`comtypes` route needs Windows with Project installed. Two consequences
+worth knowing:
+
+- it covers the **documented** API. A type library also carries hidden
+  and legacy members, so a member that compiles but isn't in the model
+  is possible: `Project.NewTasksAreManual` is one, and it is carried as
+  an explicit exception.
+- parsing the per-member files rather than the object pages avoids a
+  documentation bug — the `project.assignments` object page carries the
+  `Assignment` object's member tables by mistake, so that collection
+  would otherwise appear to have `Work`, `Cost` and `Text1..30` instead
+  of its actual six members.
 
 In addition, six companion stubs **auto-layer** without an explicit
 `--host` flag whenever any scanned file mentions their ProgID /
