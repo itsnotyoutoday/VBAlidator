@@ -108,7 +108,7 @@ def main():
     if not os.path.isdir(api):
         sys.exit(f"no api/ directory under {args.clone}")
 
-    root = ROOT
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     out_path = args.out or os.path.join(root, "tools", "data", "project_api.json")
 
     classes = defaultdict(dict)
