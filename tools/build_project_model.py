@@ -12,11 +12,14 @@ because Task.UniqueID and the pj* constants were unknown.
 
 Everything here is GENERATED from two extracted sources, both committed:
 
-  tools/data/project_api.json        103 classes, 2,924 members, parsed out of
-                                     MicrosoftDocs/VBA-Docs - the repository the
-                                     published learn.microsoft.com pages are
-                                     built from (tools/extract_project_docs.py)
+  tools/data/project_api.json        103 classes, 2,924 members
   tools/data/project_vba_enums.json  172 enumerations, 4,907 pj* constants
+
+Both are written by tools/extract_project_docs.py from a clone of
+MicrosoftDocs/VBA-Docs - the repository the published
+learn.microsoft.com/office/vba/api/project.* pages are built from. They are
+build inputs, not sources: not committed, same as build_mscomctl_model.py's
+refs file. The shipped artifact is src/models/project.json.
 
 Nothing is typed by hand except the OVERRIDES below, each of which says why it
 exists. That rule isn't fastidiousness - it's the lesson from the version of
@@ -116,14 +119,19 @@ STD_GAPS = {
 def load(path, what):
     if not os.path.exists(path):
         sys.exit(f"missing {path}\n"
-                 f"  {what} - this model is generated from extracted data, not "
-                 f"hand-written. See the module docstring.")
+                 f"  {what}\n\n"
+                 f"  git clone --filter=blob:none --no-checkout --depth 1 \\\n"
+                 f"      https://github.com/MicrosoftDocs/VBA-Docs.git\n"
+                 f"  cd VBA-Docs && git sparse-checkout init --no-cone \\\n"
+                 f"      && git sparse-checkout set '/api/project.*' '/project' \\\n"
+                 f"      && git checkout && cd ..\n"
+                 f"  python tools/extract_project_docs.py VBA-Docs")
     return json.load(open(path))
 
 
 def main():
-    api = load(API, "run tools/extract_project_docs.py against a VBA-Docs clone")
-    enum_src = load(ENUMS, "the enumeration extraction")
+    api = load(API, "extract it first:")
+    enum_src = load(ENUMS, "extract it first:")
     known = set(api["classes"])
 
     def maptype(t):

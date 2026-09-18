@@ -17,7 +17,12 @@ project.assignment.* - read that page and you would swear the collection had
 Work, Cost and Text1..30. But there is no Project.Assignments.Work.md FILE, and
 this reads the member files. Six members, which is the truth.
 
-    usage: extract_project_docs.py <VBA-Docs clone> [-o tools/data/...]
+    usage: extract_project_docs.py <VBA-Docs clone> [-d tools/data]
+
+Writes both files build_project_model.py needs:
+
+    project_api.json         classes and their members
+    project_vba_enums.json   the 172 enumerations and their 4,907 pj* constants
 
 To get the clone without downloading all of Office (VBA-Docs covers every app):
 
@@ -55,6 +60,14 @@ RETURN = re.compile(r"^##\s*Return value\s*$(?P<body>.*?)(?=^##|\Z)", re.M | re.
 # One row of the Parameters table.
 PARAM = re.compile(r"^\|\s*_(?P<pname>\w+)_\s*\|\s*(?P<req>Required|Optional)",
                    re.M | re.I)
+# One row of an enumeration's Name/Value table:
+#     |**pjResourceTypeWork**|0|Resource type is **Work**.|
+# Five pages bold the value too - |**pjResourceWarningEngagementViolation**|**8**||
+# - which is why the value's asterisks are optional rather than assumed absent.
+# and one page writes the value as "32 (&H20)", decimal then hex, so anything
+# after the number is skipped rather than assumed to be the end of the cell.
+ENUMROW = re.compile(
+    r"^\|\s*\*\*(?P<cname>\w+)\*\*\s*\|\s*\*{0,2}(?P<val>-?\w+)\*{0,2}[^|]*\|", re.M)
 
 
 def parse(path):
@@ -86,6 +99,21 @@ def parse(path):
     return name, out
 
 
+def enum_members(text):
+    """Name -> value from an enumeration page's table. Values are decimal in
+    every current page; anything that isn't an integer is kept verbatim rather
+    than coerced, so a hex or symbolic value would survive rather than become
+    a wrong number."""
+    out = {}
+    for m in ENUMROW.finditer(text):
+        raw = m.group("val")
+        try:
+            out[m.group("cname")] = int(raw)
+        except ValueError:
+            out[m.group("cname")] = raw
+    return out
+
+
 def params(text):
     """(required, total) from the Parameters table, or (0, 0) when there isn't
     one. Counts, not positions - and that is a real limitation: FilterEdit has
@@ -101,7 +129,8 @@ def params(text):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("clone", help="path to a VBA-Docs clone")
-    ap.add_argument("-o", "--out", default=None)
+    ap.add_argument("-d", "--data-dir", default=None,
+                    help="where to write both JSON files (default: tools/data)")
     args = ap.parse_args()
 
     api = os.path.join(args.clone, "api")
@@ -109,10 +138,12 @@ def main():
         sys.exit(f"no api/ directory under {args.clone}")
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    out_path = args.out or os.path.join(root, "tools", "data", "project_api.json")
+    data_dir = args.data_dir or os.path.join(root, "tools", "data")
+    out_path = os.path.join(data_dir, "project_api.json")
+    enum_path = os.path.join(data_dir, "project_vba_enums.json")
 
     classes = defaultdict(dict)
-    objects, events, skipped = {}, defaultdict(list), []
+    objects, events, skipped, enums = {}, defaultdict(list), [], {}
 
     for fn in sorted(os.listdir(api)):
         if not fn.lower().startswith("project.") or not fn.endswith(".md"):
@@ -124,6 +155,14 @@ def main():
         name, info = got
 
         if info["kind"] == "enumeration":
+            members = enum_members(
+                open(os.path.join(api, fn), encoding="utf-8", errors="replace").read())
+            if members:
+                enums[name] = {
+                    "members": members,
+                    "url": "https://learn.microsoft.com/en-us/office/vba/api/"
+                           + fn[:-3].lower(),
+                }
             continue
         if info["kind"] == "object":
             # The H1 carries the canonical casing; filenames are inconsistent
@@ -150,14 +189,20 @@ def main():
         "classes": {c: classes[c] for c in sorted(classes)},
         "events": {c: sorted(v) for c, v in sorted(events.items())},
     }
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    os.makedirs(data_dir, exist_ok=True)
     with open(out_path, "w") as fh:
         json.dump(data, fh, indent=1, sort_keys=True)
+        fh.write("\n")
+    with open(enum_path, "w") as fh:
+        json.dump(enums, fh, indent=1, sort_keys=True)
         fh.write("\n")
 
     total = sum(len(m) for m in classes.values())
     print(f"wrote {out_path}")
     print(f"  {len(classes)} classes with members, {total} members")
+    print(f"wrote {enum_path}")
+    print(f"  {len(enums)} enumerations, "
+          f"{sum(len(e['members']) for e in enums.values())} constants")
     print(f"  {len(objects)} object pages, "
           f"{sum(len(v) for v in events.values())} events (not modelled)")
     if skipped:

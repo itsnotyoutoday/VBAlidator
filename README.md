@@ -135,22 +135,22 @@ worth knowing:
   would otherwise appear to have `Work`, `Cost` and `Text1..30` instead
   of its actual six members.
 
-Rebuilding it needs no Windows and no network:
-
-```bash
-python tools/build_project_model.py     # tools/data/*.json -> src/models/project.json
-```
-
-The two inputs under `tools/data/` are committed. To regenerate them from
-scratch, sparse-clone the docs source and re-extract:
+Rebuilding it needs no Windows and no `comtypes` — just the docs source:
 
 ```bash
 git clone --filter=blob:none --no-checkout --depth 1 \
     https://github.com/MicrosoftDocs/VBA-Docs.git
 cd VBA-Docs && git sparse-checkout init --no-cone \
     && git sparse-checkout set '/api/project.*' '/project' && git checkout && cd ..
-python tools/extract_project_docs.py VBA-Docs
+
+python tools/extract_project_docs.py VBA-Docs   # -> tools/data/*.json
+python tools/build_project_model.py             # -> src/models/project.json
 ```
+
+`tools/data/` holds build inputs and isn't committed, the same way
+`build_mscomctl_model.py` writes its refs file at build time. Extraction is
+deterministic: re-running it against the same docs commit reproduces the same
+bytes.
 
 
 In addition, six companion stubs **auto-layer** without an explicit
