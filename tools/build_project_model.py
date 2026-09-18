@@ -81,6 +81,16 @@ RETYPE = {
     ("Project", "Resources"): "Resources",
 }
 
+# Documented parameter types are NOT carried into the model. The analyser
+# defaults an argument with no `mechanism` to ByRef and then strict-compares its
+# type against whatever it inferred at the call site; a type typed `Variant`
+# short-circuits that check. Since the docs' types are loose (enum names, bare
+# "Variant", 135 members with no type at all), claiming them would risk
+# rejecting valid code - the failure direction that gets a checker switched off.
+# Names and per-position optionality are carried, which is what enables
+# named-argument checking without that risk.
+ARG_TYPE = "Variant"
+
 RELAX_ARGS = {
     # Documented Required, yet called bare everywhere including Microsoft's own
     # samples. A compile-safety checker that flags working code gets switched
@@ -159,7 +169,9 @@ def main():
     for cls, members in api["classes"].items():
         out = {}
         for nm, spec in members.items():
-            req, total = spec.get("args", [0, 0])
+            plist = spec.get("params") or []
+            total = len(plist)
+            req = sum(1 for a in plist if not a["optional"])
             if (cls, nm) in RELAX_ARGS:
                 req = 0
             rt = RETYPE.get((cls, nm)) or maptype(spec.get("type"))
@@ -167,8 +179,13 @@ def main():
             if spec["kind"] == "method" or total:
                 # Properties take arguments too - Project.BaselineSavedDate
                 # does - so assuming zero would reject a valid call.
-                out[nm] = {"type": "Function", "returns": rt,
-                           "min_args": req, "max_args": total}
+                entry = {"type": "Function", "returns": rt,
+                         "min_args": req, "max_args": total}
+                if plist:
+                    entry["args"] = [{"name": a["name"], "type": ARG_TYPE,
+                                      "is_optional": a["optional"]}
+                                     for a in plist]
+                out[nm] = entry
             else:
                 out[nm] = {"type": rt}
         classes[cls] = {"type": cls, "members": out}

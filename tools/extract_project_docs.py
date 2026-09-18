@@ -57,9 +57,12 @@ H1 = re.compile(r"^#\s+(?P<name>[A-Za-z0-9_.]+)\s+"
 # "Read-only **Long**." / "Read/write **Variant**."
 PROPTYPE = re.compile(r"Read(?:-only|/write)\s+\*\*([A-Za-z0-9_]+)\*\*")
 RETURN = re.compile(r"^##\s*Return value\s*$(?P<body>.*?)(?=^##|\Z)", re.M | re.S)
-# One row of the Parameters table.
-PARAM = re.compile(r"^\|\s*_(?P<pname>\w+)_\s*\|\s*(?P<req>Required|Optional)",
-                   re.M | re.I)
+# One row of the Parameters table:
+#     | _StartDate_|Required|**Variant**|The start date ... |
+PARAM = re.compile(
+    r"^\|\s*_(?P<pname>\w+)_\s*\|\s*(?P<req>Required|Optional)\s*\|"
+    r"\s*\*{0,2}(?P<ptype>[A-Za-z0-9_]+)?",
+    re.M | re.I)
 # One row of an enumeration's Name/Value table:
 #     |**pjResourceTypeWork**|0|Resource type is **Work**.|
 # Five pages bold the value too - |**pjResourceWarningEngagementViolation**|**8**||
@@ -85,7 +88,7 @@ def parse(path):
         # Properties CAN take arguments - Project.BaselineSavedDate does. Not
         # assuming zero is the difference between checking a call and rejecting
         # a valid one.
-        out["args"] = params(text)
+        out["params"] = params(text)
     elif kind == "method":
         r = RETURN.search(text)
         if r:
@@ -95,7 +98,7 @@ def parse(path):
         else:
             # No Return value section at all is how MS writes a Sub.
             out["type"] = "Nothing"
-        out["args"] = params(text)
+        out["params"] = params(text)
     return name, out
 
 
@@ -115,15 +118,23 @@ def enum_members(text):
 
 
 def params(text):
-    """(required, total) from the Parameters table, or (0, 0) when there isn't
-    one. Counts, not positions - and that is a real limitation: FilterEdit has
-    required arguments at positions 1, 2 and 9, so a count alone accepts three
-    arguments that Project would reject."""
-    rows = PARAM.findall(text)
-    if not rows:
-        return [0, 0]
-    req = sum(1 for _, r in rows if r.lower() == "required")
-    return [req, len(rows)]
+    """Per-argument name, optionality and documented type, in declaration order.
+
+    Order matters and counts alone lose it. Application.FilterEdit has required
+    arguments at positions 1, 2 and 9 with optional ones in between, so
+    "3 required of 13" accepts three positional arguments that Project would
+    reject. Keeping the list lets the model say which positions those are, and
+    carries the argument NAMES - which is how Project's command methods are
+    actually called (FilterEdit Name:="x", Test:="contains"), so it is the
+    difference between checking those calls and not."""
+    out = []
+    for m in PARAM.finditer(text):
+        out.append({
+            "name": m.group("pname"),
+            "optional": m.group("req").lower() == "optional",
+            "type": m.group("ptype") or None,
+        })
+    return out
 
 
 def main():
