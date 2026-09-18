@@ -99,8 +99,14 @@ RELAX_ARGS = {
     ("Task", "UnlinkSuccessors"),
 }
 
-# Reachable unqualified. All are Application members; MS sample code uses them
-# bare throughout ("ActiveProject.Tasks.Add ...", "Projects.Count").
+# Typed globals. Everything Application exposes is ALSO promoted to the global
+# namespace below - see the note there - but these few are named here so they
+# resolve to a modelled class rather than whatever the Application page says.
+#
+# Nothing non-Project goes in here. An earlier version carried UserForms, Load,
+# Unload and the vb*Focus constants because Project code using them reported
+# false errors - but they are MSForms and plain VBA, so they are now in
+# msforms.json and std_model.json where every host gets them.
 GLOBALS = {
     "Application": "Application",
     "ActiveProject": "Project",
@@ -109,22 +115,6 @@ GLOBALS = {
     "ActiveWindow": "Window",
     "Projects": "Projects",
 }
-
-# VBA/MSForms names missing from src/std_model.json. Not Project-specific, so
-# they belong in the standard model - carried here meanwhile so Project code
-# using them doesn't report false errors.
-STD_GAPS = {
-    "UserForms": {"type": "Object"},
-    "Load": {"type": "Function", "returns": "Nothing", "min_args": 1, "max_args": 1},
-    "Unload": {"type": "Function", "returns": "Nothing", "min_args": 1, "max_args": 1},
-    "vbHide": {"type": "Long"},
-    "vbNormalFocus": {"type": "Long"},
-    "vbMinimizedFocus": {"type": "Long"},
-    "vbMaximizedFocus": {"type": "Long"},
-    "vbNormalNoFocus": {"type": "Long"},
-    "vbMinimizedNoFocus": {"type": "Long"},
-}
-
 
 def load(path, what):
     if not os.path.exists(path):
@@ -195,7 +185,19 @@ def main():
 
     globals_ = {nm: {"type": t if t in classes else "Object"}
                 for nm, t in GLOBALS.items()}
-    globals_.update(STD_GAPS)
+
+    # In Project, as in Excel, the whole Application surface is reachable
+    # unqualified: FieldNameToFieldConstant("Text1", pjTask), TableEditEx Name:=...,
+    # OutlineShowAllTasks. Microsoft's own samples are written that way.
+    #
+    # excel.json does exactly this - all 333 of its Application members appear in
+    # globals as well - and not following it cost 1,271 false errors across 57,000
+    # lines of third-party Project VBA, from 70 distinct members. Six hand-listed
+    # globals was the wrong model of how Project VBA is written.
+    #
+    # setdefault, so the typed entries above win where they overlap.
+    for nm, spec in classes.get("Application", {}).get("members", {}).items():
+        globals_.setdefault(nm, spec)
 
     enums, pj = {}, 0
     for enum_name, body in enum_src.items():
